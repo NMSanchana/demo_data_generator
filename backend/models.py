@@ -1,0 +1,100 @@
+"""
+Request and response models for the demo data generator API.
+"""
+
+from typing import Any
+
+from pydantic import BaseModel, Field, model_validator
+
+from localedata.domain import DomainEnum
+from localedata.geography import ContinentEnum, CountryEnum, StateEnum, get_country, get_state
+
+
+class GeographyInput(BaseModel):
+    continent: ContinentEnum = Field(..., description="Continent code, e.g. AS for Asia")
+    country:   CountryEnum   = Field(..., description="ISO 3166-1 alpha-2 country code")
+    state:     StateEnum | None = Field(None, description="ISO 3166-2 subdivision code, optional")
+
+    @model_validator(mode="after")
+    def _validate_hierarchy(self) -> "GeographyInput":
+        country_entry = get_country(self.country.value)
+        if country_entry is None:
+            raise ValueError(f"Unknown country code: {self.country.value}")
+        if country_entry["continent_code"] != self.continent.value:
+            raise ValueError(
+                f"Country {self.country.value} does not belong to continent {self.continent.value}"
+            )
+        if self.state is not None:
+            state_entry = get_state(self.state.value)
+            if state_entry is None:
+                raise ValueError(f"Unknown state/region code: {self.state.value}")
+            if state_entry["country_code"] != self.country.value:
+                raise ValueError(
+                    f"State/region {self.state.value} does not belong to country {self.country.value}"
+                )
+        return self
+
+
+class GenerateRequest(BaseModel):
+    module:    str = Field(..., description="ERP module name, e.g. 'Skill Management'")
+    screen:    str | None = Field(
+        None,
+        description="Screen name, e.g. 'Skill Domain'. Omit to generate for every real screen under this module.",
+    )
+    domain:    DomainEnum = Field(..., description="Domain to flavor the generated vocabulary/content, e.g. 'Agriculture & Farming'")
+    subdomain: str | None = Field(None, description="Optional further specialisation, e.g. 'Organic Farming'")
+    geography: GeographyInput = Field(..., description="Continent/Country/State to flavor the demo data for")
+    row_count: int | None = Field(None, ge=1, le=100, description="Rows to generate per screen (default 20)")
+
+
+class ScreenResult(BaseModel):
+    status:               str
+    message:               str | None = None
+    screen:                str
+    resolved_path:          str | None = None
+    fields:                 list[dict] = []
+    rows:                   list[dict] = []
+    row_count:              int = 0
+    apm_ready:              bool = False
+    apm_disabled_reason:    str | None = None
+
+
+class GenerateResponse(BaseModel):
+    module:  str
+    results: list[ScreenResult] = []
+
+
+class SettingsSaveRequest(BaseModel):
+    module:        str = Field(..., description="ERP module name, e.g. 'Skill Management'")
+    screen:        str | None = Field(
+        None,
+        description="Screen name, e.g. 'Skill Domain'. Omit/None to save the module-level default "
+                    "that applies to every screen under this module unless overridden.",
+    )
+    use_domain:    bool = Field(True, description="Whether the domain component is enabled")
+    use_subdomain: bool = Field(True, description="Whether the subdomain component is enabled")
+    use_geography: bool = Field(True, description="Whether the geography component is enabled")
+
+
+class SettingsResponse(BaseModel):
+    module:        str
+    screen:        str | None = None
+    use_domain:    bool
+    use_subdomain: bool
+    use_geography: bool
+    is_default:    bool = Field(
+        ..., description="True if this came from the all-enabled fallback (no row saved yet)"
+    )
+
+
+class SaveRowRequest(BaseModel):
+    module: str = Field(..., description="Module name as submitted to /generate")
+    screen: str = Field(..., description="Screen name whose row this is")
+    row:    dict[str, Any] = Field(..., description="A single generated/edited preview row")
+
+
+class SaveRowResponse(BaseModel):
+    ok:          bool
+    status_code: int | None = None
+    error:       str | None = None
+    response:    Any = None
