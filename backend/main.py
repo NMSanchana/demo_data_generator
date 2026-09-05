@@ -1,23 +1,3 @@
-"""
-FastAPI entry point for the demo data generator.
-
-/generate orchestration (see workflow/graph.py's module docstring for why
-resolution lives here rather than as graph nodes):
-
-  1. Load settings for this module/screen (unchanged — service/settings_service.py).
-  2. Resolve every screen this request covers (one screen, or every real
-     screen under the module when Screen is left blank) — fuzzy-first with
-     LLM fallback, via Agents/architecture_agent.py.
-  3. For each resolved screen: deterministic schema extraction (cached),
-     then APM schema resolution (cached) so the data generator can be told
-     the real save-target type of every field.
-  4. ONE shared entity-assignment LLM call across every resolved screen's
-     picklist fields, so a full-module run shows consistent named entities
-     across screens.
-  5. Invoke the (per-screen) LangGraph generation pipeline once per screen.
-  6. Assemble and return per-screen results.
-"""
-
 import logging
 import os
 
@@ -43,7 +23,6 @@ from Agents.data_generator_agent import build_entity_assignment_map
 from steps import schema_extraction
 from steps.apm_schema_resolution import resolve_for_generation
 from tools.row_mapper import map_row_to_schema
-from localedata.geography import build_geography_display, geography_tree, all_states_flat
 from localedata.domain import DOMAIN_LIST
 
 load_dotenv()
@@ -90,15 +69,10 @@ async def health():
 
 
 # ---------------------------------------------------------------------
-# Metadata endpoints backing the frontend's structured selectors
+# Metadata endpoints backing the frontend's selectors
 # ---------------------------------------------------------------------
 
-@app.get("/meta/geography", summary="Continent -> Country -> State/Region tree, plus a flat searchable state list")
-def get_geography() -> dict:
-    return {"tree": geography_tree(), "states_flat": all_states_flat()}
-
-
-@app.get("/meta/domains", summary="Full worldwide Domain list backing the searchable Domain dropdown")
+@app.get("/meta/domains", summary="Full worldwide Domain list backing the searchable Domain dropdown (quick-pick only -- any typed value is also accepted)")
 def get_domains() -> dict:
     return {"domains": DOMAIN_LIST}
 
@@ -149,15 +123,14 @@ async def _resolve_screens(module: str, screen: str | None) -> list[dict]:
 async def generate(request: GenerateRequest):
     settings = await settings_service.get_settings(request.module, request.screen)
 
-    domain_value = request.domain.value if settings["use_domain"] else None
+    domain_value = request.domain if settings["use_domain"] else None
     subdomain_value = request.subdomain if (settings["use_subdomain"] and request.subdomain) else None
-    geography_display = None
-    if settings["use_geography"]:
-        geography_display = build_geography_display(
-            request.geography.continent.value,
-            request.geography.country.value,
-            request.geography.state.value if request.geography.state else None,
-        )
+    # Raw, as-typed geography text ("Singanallur", "near Coimbatore", ...).
+    # Resolving this to a real place is NOT done here -- it happens inside
+    # the first screen's data_generator_agent_node call below, and that
+    # resolved value is then reused for every subsequent screen in this
+    # same request (see the loop further down).
+    raw_geography = request.geography if settings["use_geography"] else None
 
     resolved_screens = await _resolve_screens(request.module, request.screen)
     if not resolved_screens:
@@ -206,11 +179,19 @@ async def generate(request: GenerateRequest):
         module=request.module,
         domain=domain_value,
         subdomain=subdomain_value,
-        geography=geography_display,
+        geography=raw_geography,
         picklist_field_names=picklist_field_names,
     )
 
     # Phase 3: per-screen row generation via the LangGraph pipeline.
+    # geography starts as the raw typed text; the FIRST screen's
+    # generation call resolves it to a real place (e.g. "Singanallur" ->
+    # "Tamil Nadu, India") and every screen after that reuses the
+    # resolved value directly instead of re-resolving the same raw text
+    # independently per screen (see Agents/data_generator_agent.py).
+    geography_for_next_screen = raw_geography
+    geography_resolved_yet = False
+
     results: list[ScreenResult] = []
     for ctx in screen_contexts:
         if not ctx["ok"]:
@@ -225,7 +206,8 @@ async def generate(request: GenerateRequest):
             "screen": ctx["screen_name"],
             "domain": domain_value,
             "subdomain": subdomain_value,
-            "geography": geography_display,
+            "geography": geography_for_next_screen,
+            "geography_already_resolved": geography_resolved_yet,
             "row_count": request.row_count,
             "use_domain": settings["use_domain"],
             "use_subdomain": settings["use_subdomain"],
@@ -246,6 +228,10 @@ async def generate(request: GenerateRequest):
             results.append(ScreenResult(status="error", message=final_state["generation_error"], screen=ctx["screen_name"]))
             continue
 
+        if settings["use_geography"] and final_state.get("resolved_geography"):
+            geography_for_next_screen = final_state["resolved_geography"]
+            geography_resolved_yet = True
+
         rows = final_state.get("generated_rows") or []
         results.append(ScreenResult(
             status="ok",
@@ -256,6 +242,7 @@ async def generate(request: GenerateRequest):
             row_count=len(rows),
             apm_ready=apm_ready,
             apm_disabled_reason=None if apm_ready else apm_resolution.get("error"),
+            resolved_geography=final_state.get("resolved_geography"),
         ))
 
     return GenerateResponse(module=request.module, results=results)

@@ -1,15 +1,3 @@
-"""
-LangGraph state definition for the demo data generator's per-screen
-generation pipeline.
-
-Resolution (architecture + schema extraction + APM schema resolution) and
-the cross-screen shared entity assignment happen ONCE per request, across
-every resolved screen, in main.py before this graph is invoked -- see the
-module docstring in workflow/graph.py for why that fan-out lives outside
-the graph. This state only covers what happens per screen from that point
-on: row generation, then the code-only identifier dedup safety net.
-"""
-
 from typing import TypedDict
 
 
@@ -19,7 +7,17 @@ class GeneratorState(TypedDict, total=False):
     screen:    str
     domain:    str | None
     subdomain: str | None
-    geography: str | None            # human-readable display string, e.g. "Tamil Nadu, India"
+    geography: str | None            # free text as typed by the user ("Singanallur"),
+                                      # or -- for every screen after the first in a
+                                      # full-module request -- the already-resolved
+                                      # place from the first screen's generation call
+                                      # (see geography_already_resolved below and
+                                      # Agents/data_generator_agent.py's module docstring)
+    geography_already_resolved: bool  # False for the first screen (geography is raw
+                                      # user text, the agent must resolve it itself);
+                                      # True for every later screen in the same
+                                      # request (geography is already a resolved place,
+                                      # reuse it as-is instead of re-resolving)
     row_count: int | None
 
     use_domain:    bool
@@ -40,5 +38,8 @@ class GeneratorState(TypedDict, total=False):
     entity_assignment_map: dict
 
     # --- Data generator agent outputs ---
-    generated_rows:   list[dict]
-    generation_error: str | None
+    generated_rows:      list[dict]
+    resolved_geography:  str | None   # what geography text was resolved to, e.g.
+                                      # "Tamil Nadu, India" -- None if geography was
+                                      # disabled/not provided for this screen
+    generation_error:    str | None

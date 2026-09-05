@@ -31,12 +31,6 @@ async function parseErrorMessage(res) {
   }
 }
 
-export async function getGeography() {
-  const res = await fetch(`${BASE_URL}/meta/geography`);
-  if (!res.ok) throw new Error(await parseErrorMessage(res));
-  return res.json();
-}
-
 export async function getDomains() {
   const res = await fetch(`${BASE_URL}/meta/domains`);
   if (!res.ok) throw new Error(await parseErrorMessage(res));

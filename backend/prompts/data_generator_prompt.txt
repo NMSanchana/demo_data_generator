@@ -13,9 +13,19 @@ You will be given:
 - subdomain: optional further specialisation (e.g. Organic Farming) —
   present only if the "subdomain" component is enabled AND the user
   supplied one; omitted otherwise
-- geography: free-text location (e.g. "Tamil Nadu, India") — present only
-  if the "geography" component is enabled for this screen; omitted
-  otherwise
+- geography: any location text the user typed — could be a precise place
+  ("Tamil Nadu, India"), a city or locality that isn't a top-level region
+  ("Singanallur", "Koramangala"), a vague description ("near Coimbatore"),
+  or already-resolved text handed to you from a previous screen in this
+  same request (see geography_already_resolved below). Present only if
+  the "geography" component is enabled for this screen; omitted otherwise.
+- geography_already_resolved: "true" or "false" — present only alongside
+  geography. "false" means this is the first screen in the request and
+  geography is raw, possibly-imprecise user text you must resolve
+  yourself. "true" means an earlier screen in this same request already
+  resolved it (e.g. to "Tamil Nadu, India") — reuse that resolved value
+  as-is rather than trying to re-derive it, so every screen in a
+  multi-screen run agrees on the exact same place.
 - apm_field_types (optional): for some fields, the REAL type that field
   must be when saved to the backing system, e.g.
   {"DomainType": {"type": "integer", "format": "byte"}}. When a field name
@@ -51,8 +61,27 @@ fields.
   for this screen — do NOT invent a value for it and do NOT let it
   influence the data. Generate generic-but-realistic values for that
   screen instead.
-- When geography IS provided, use local naming conventions, currencies,
-  date formats, and terminology for that geography.
+- When geography IS provided:
+  - If geography_already_resolved is "false", first resolve the given
+    text to a real place using your own geographic knowledge — a
+    locality/neighborhood resolves to its city and state/region and
+    country (e.g. "Singanallur" -> a locality in Coimbatore, Tamil Nadu,
+    India, so the resolved place is "Tamil Nadu, India"); a landmark or
+    vague description resolves the same way; text that's already a
+    state/country needs no real change. Prefer "State/Region, Country"
+    as the resolved form; if the input is only ever meaningfully a
+    country (e.g. "Japan", or a small country with no relevant
+    state-level distinction), "Country" alone is fine. If the text is
+    genuinely unresolvable or nonsensical, don't fail — just pass it
+    through unchanged as both the resolved value and the flavor context.
+  - If geography_already_resolved is "true", the given text IS already
+    the resolved place — use it directly, do not attempt to re-resolve
+    or second-guess it.
+  - Use the resolved place (never the raw, unresolved input) for local
+    naming conventions, currencies, date formats, and terminology.
+  - You must return your resolved place as "resolved_geography" in the
+    output JSON (see the output shape below), even when
+    geography_already_resolved is "true" (just echo it back).
 - Picklist fields should have consistent, domain-specific values (not
   generic placeholder text) unless constrained by preferred_picklist_values
   above, in which case use only those values.
@@ -69,10 +98,14 @@ fields.
 
 Return ONLY valid JSON in exactly this shape:
 {
+  "resolved_geography": "Tamil Nadu, India",
   "rows": [
     { "SkillDomainCode": "AGRI-DOM-001", "SkillDomainName": "Soil Preparation", ... },
     ...
   ]
 }
+
+Omit "resolved_geography" entirely if geography was not provided (the
+component is disabled for this screen).
 
 No markdown fences, no explanation outside the JSON.

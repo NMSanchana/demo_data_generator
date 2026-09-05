@@ -1,34 +1,26 @@
+"""
+Request and response models for the demo data generator API.
+
+Geography and Domain are both plain free-text strings now, not enums:
+
+- Geography used to be a strict pycountry-backed Continent/Country/State
+  struct requiring three dropdowns. It's now whatever the user types --
+  "Singanallur", "Tamil Nadu", "near Coimbatore", anything. The LLM itself
+  resolves that text to a real place (locality -> district/state ->
+  country) as part of the existing data generation call in
+  Agents/data_generator_agent.py -- no separate resolution agent, no extra
+  LLM call. See that file's resolve-then-generate flow.
+- Domain still has a dropdown in the frontend for quick-pick, but the
+  backend never enforced a closed enum in the prompt anyway -- the enum
+  was only a Pydantic-layer constraint. Dropping it just means someone
+  typing a domain that isn't in the dropdown's list flows straight through
+  instead of being rejected.
+- Subdomain was already free text end-to-end -- unchanged.
+"""
+
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
-
-from localedata.domain import DomainEnum
-from localedata.geography import ContinentEnum, CountryEnum, StateEnum, get_country, get_state
-
-
-class GeographyInput(BaseModel):
-    continent: ContinentEnum = Field(..., description="Continent code, e.g. AS for Asia")
-    country:   CountryEnum   = Field(..., description="ISO 3166-1 alpha-2 country code")
-    state:     StateEnum | None = Field(None, description="ISO 3166-2 subdivision code, optional")
-
-    @model_validator(mode="after")
-    def _validate_hierarchy(self) -> "GeographyInput":
-        country_entry = get_country(self.country.value)
-        if country_entry is None:
-            raise ValueError(f"Unknown country code: {self.country.value}")
-        if country_entry["continent_code"] != self.continent.value:
-            raise ValueError(
-                f"Country {self.country.value} does not belong to continent {self.continent.value}"
-            )
-        if self.state is not None:
-            state_entry = get_state(self.state.value)
-            if state_entry is None:
-                raise ValueError(f"Unknown state/region code: {self.state.value}")
-            if state_entry["country_code"] != self.country.value:
-                raise ValueError(
-                    f"State/region {self.state.value} does not belong to country {self.country.value}"
-                )
-        return self
+from pydantic import BaseModel, Field
 
 
 class GenerateRequest(BaseModel):
@@ -37,9 +29,9 @@ class GenerateRequest(BaseModel):
         None,
         description="Screen name, e.g. 'Skill Domain'. Omit to generate for every real screen under this module.",
     )
-    domain:    DomainEnum = Field(..., description="Domain to flavor the generated vocabulary/content, e.g. 'Agriculture & Farming'")
+    domain:    str = Field(..., min_length=1, description="Domain to flavor the generated vocabulary/content -- e.g. 'Agriculture & Farming', or anything typed")
     subdomain: str | None = Field(None, description="Optional further specialisation, e.g. 'Organic Farming'")
-    geography: GeographyInput = Field(..., description="Continent/Country/State to flavor the demo data for")
+    geography: str = Field(..., min_length=1, description="Any location text -- a locality, city, state, or country. Resolved to a real place by the generation agent.")
     row_count: int | None = Field(None, ge=1, le=100, description="Rows to generate per screen (default 20)")
 
 
@@ -53,6 +45,9 @@ class ScreenResult(BaseModel):
     row_count:              int = 0
     apm_ready:              bool = False
     apm_disabled_reason:    str | None = None
+    resolved_geography:     str | None = Field(
+        None, description="What the agent resolved the typed geography text to, e.g. 'Tamil Nadu, India'"
+    )
 
 
 class GenerateResponse(BaseModel):

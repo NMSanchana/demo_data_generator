@@ -1,11 +1,8 @@
 import { useEffect, useState } from "react";
 import { useApp } from "../AppContext";
-import { generateData, getDomains, getGeography } from "../api";
+import { generateData, getDomains } from "../api";
 import ResultPanel from "./ResultPanel";
-import GeographySelector from "./GeographySelector";
 import SearchableSelect from "./SearchableSelect";
-
-const emptyGeography = { continent: "", country: "", state: "" };
 
 export default function GeneratePage() {
   const { login } = useApp();
@@ -14,11 +11,10 @@ export default function GeneratePage() {
   const [screen, setScreen] = useState("");
   const [domain, setDomain] = useState("");
   const [subdomain, setSubdomain] = useState("");
-  const [geography, setGeography] = useState(emptyGeography);
+  const [geography, setGeography] = useState("");
   const [rowCount, setRowCount] = useState(20);
 
   const [domainOptions, setDomainOptions] = useState([]);
-  const [geographyData, setGeographyData] = useState(null);
   const [metaError, setMetaError] = useState(null);
 
   const [loading, setLoading] = useState(false);
@@ -26,11 +22,8 @@ export default function GeneratePage() {
   const [results, setResults] = useState([]);
 
   useEffect(() => {
-    Promise.all([getDomains(), getGeography()])
-      .then(([domainsRes, geographyRes]) => {
-        setDomainOptions(domainsRes.domains.map((d) => ({ value: d, label: d })));
-        setGeographyData(geographyRes);
-      })
+    getDomains()
+      .then((res) => setDomainOptions(res.domains.map((d) => ({ value: d, label: d }))))
       .catch((err) => setMetaError(err.message));
   }, []);
 
@@ -41,12 +34,12 @@ export default function GeneratePage() {
       setError("Module is required.");
       return;
     }
-    if (!domain) {
+    if (!domain.trim()) {
       setError("Domain is required.");
       return;
     }
-    if (!geography.country) {
-      setError("Geography is required — pick at least a country.");
+    if (!geography.trim()) {
+      setError("Geography is required — type any location, e.g. a city, state, or country.");
       return;
     }
 
@@ -57,13 +50,9 @@ export default function GeneratePage() {
     const payload = {
       module: module.trim(),
       screen: screen.trim() || null,
-      domain,
+      domain: domain.trim(),
       subdomain: subdomain.trim() || null,
-      geography: {
-        continent: geography.continent,
-        country: geography.country,
-        state: geography.state || null,
-      },
+      geography: geography.trim(),
       row_count: rowCount ? Number(rowCount) : null,
     };
 
@@ -91,7 +80,7 @@ export default function GeneratePage() {
       <form className="panel" onSubmit={handleGenerate}>
         {metaError && (
           <div className="status-banner error">
-            Could not load domain/geography lists from the backend: {metaError}
+            Could not load the domain list from the backend: {metaError}
           </div>
         )}
 
@@ -123,7 +112,7 @@ export default function GeneratePage() {
         <div className="field-row">
           <SearchableSelect
             label="Domain"
-            placeholder="Search domain, e.g. Agriculture & Farming..."
+            placeholder="Search or type any domain..."
             options={domainOptions}
             value={domain}
             onChange={setDomain}
@@ -141,9 +130,20 @@ export default function GeneratePage() {
           </div>
         </div>
 
-        {geographyData && (
-          <GeographySelector geographyData={geographyData} value={geography} onChange={setGeography} />
-        )}
+        <div className="field">
+          <label htmlFor="gen-geography">Geography</label>
+          <input
+            id="gen-geography"
+            type="text"
+            placeholder="Type any location — a locality, city, state, or country (e.g. Singanallur, Tamil Nadu, Japan)"
+            value={geography}
+            onChange={(e) => setGeography(e.target.value)}
+          />
+          <span className="hint">
+            Doesn't need to be exact — the generator resolves it to a real place
+            (e.g. "Singanallur" → Tamil Nadu, India)
+          </span>
+        </div>
 
         <div className="field">
           <label htmlFor="gen-row-count">Row count</label>

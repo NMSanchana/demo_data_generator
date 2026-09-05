@@ -68,6 +68,10 @@ async def build_entity_assignment_map(
     field name, once per request, so every screen in a full-module run
     that shares a picklist field name (e.g. "Status", "Department") shows
     the SAME entity pool rather than each screen inventing its own.
+
+    `geography` here is whatever raw text the user typed -- this call
+    doesn't need the fully-resolved place name, just enough context to
+    flavor naming, so it runs before geography resolution has happened.
     """
     if not picklist_field_names:
         return {}
@@ -95,7 +99,7 @@ async def build_entity_assignment_map(
 
 
 # --------------------------------------------------------------------
-# Per-screen row generation
+# Per-screen row generation (+ geography resolution, first screen only)
 # --------------------------------------------------------------------
 
 def _build_user_message(state: dict) -> str:
@@ -121,6 +125,10 @@ def _build_user_message(state: dict) -> str:
 
     if state.get("use_geography", True) and state.get("geography"):
         parts.append(f"geography: {state['geography']}")
+        parts.append(
+            "geography_already_resolved: "
+            + ("true" if state.get("geography_already_resolved") else "false")
+        )
 
     apm_type_hints = state.get("apm_type_hints") or {}
     if apm_type_hints:
@@ -157,23 +165,30 @@ def _build_user_message(state: dict) -> str:
 async def data_generator_agent_node(state: dict) -> dict:
     """
     LangGraph node — generates demo rows for the fields schema extraction
-    already found, using only the enabled components.
+    already found, using only the enabled components. When geography is
+    enabled and hasn't been resolved yet this request (see
+    state["geography_already_resolved"]), this call also resolves the
+    typed geography text to a real place and returns it as
+    resolved_geography.
 
     Reads:
       state["generated_fields"], state["module"], state["screen"],
       state["row_count"], state["domain"], state["subdomain"],
-      state["geography"], state["use_domain"], state["use_subdomain"],
-      state["use_geography"], state["apm_type_hints"],
-      state["entity_assignment_map"]
+      state["geography"], state["geography_already_resolved"],
+      state["use_domain"], state["use_subdomain"], state["use_geography"],
+      state["apm_type_hints"], state["entity_assignment_map"]
 
     Writes:
-      state["generated_rows"]   — list of row dicts (one per demo record)
-      state["generation_error"] — str | None
+      state["generated_rows"]     — list of row dicts (one per demo record)
+      state["resolved_geography"] — str | None, only meaningful when
+                                     geography is enabled
+      state["generation_error"]   — str | None
     """
     fields = state.get("generated_fields") or []
     if not fields:
         return {
             "generated_rows": [],
+            "resolved_geography": None,
             "generation_error": "No fields available — schema extraction must run first.",
         }
 
@@ -190,11 +205,19 @@ async def data_generator_agent_node(state: dict) -> dict:
     result = await _ask_llm_json(system_prompt, user_message, temperature=0.8)
 
     if "error" in result:
-        return {"generated_rows": [], "generation_error": result["error"]}
+        return {"generated_rows": [], "resolved_geography": None, "generation_error": result["error"]}
 
     rows = result.get("rows") or []
     if not rows:
-        return {"generated_rows": [], "generation_error": "Agent returned no rows."}
+        return {"generated_rows": [], "resolved_geography": None, "generation_error": "Agent returned no rows."}
+
+    resolved_geography = None
+    if state.get("use_geography", True) and state.get("geography"):
+        # Fall back to the raw input if the model omitted it for some
+        # reason -- worst case the "resolved" value is just what was
+        # typed, which is still correct behavior (unresolvable input
+        # should never block generation).
+        resolved_geography = result.get("resolved_geography") or state["geography"]
 
     logger.info("data_generator_agent_node: generated %d row(s)", len(rows))
-    return {"generated_rows": rows, "generation_error": None}
+    return {"generated_rows": rows, "resolved_geography": resolved_geography, "generation_error": None}
