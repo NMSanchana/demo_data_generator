@@ -1,8 +1,3 @@
-"""
-Loads prompt text files from backend/prompts/.
-Cached on first read — prompts don't change at runtime.
-"""
-
 from functools import lru_cache
 from pathlib import Path
 

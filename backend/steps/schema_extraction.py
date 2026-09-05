@@ -1,18 +1,3 @@
-"""
-Schema extraction step — deterministic (no LLM call), cached.
-
-This replaces the old codebase's Agents/analysis_agent.py, which used an
-LLM to re-extract fields from the same HTML on every single request. Field
-discovery is structural parsing of real source code, not "demo data"
-generation, so doing it deterministically is strictly better: faster,
-cheaper, and reads ground truth off the real repo instead of asking a
-model to summarize HTML it just saw once (see Section 4 of the
-remediation spec).
-
-Named a "step" rather than an "agent" throughout the codebase so the
-naming doesn't imply an LLM call that no longer happens.
-"""
-
 import logging
 
 from tools import schema_cache

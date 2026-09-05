@@ -1,7 +1,3 @@
-"""
-Request and response models for the demo data generator API.
-"""
-
 from typing import Any
 
 from pydantic import BaseModel, Field, model_validator

@@ -1,13 +1,3 @@
-"""
-Worldwide Domain list, backing the single consolidated "Domain" field
-(Section 1, point 5 of the remediation spec).
-
-This replaces the old build's separate "Industry" concept outright — same
-role Industry used to play (flavors the generated vocabulary/content), just
-renamed. Content is carried over unchanged from the old
-localedata/industry.py list.
-"""
-
 from enum import Enum
 
 DOMAIN_LIST = [

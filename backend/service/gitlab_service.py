@@ -1,12 +1,3 @@
-"""
-GitLab service for the demo data generator.
-
-Reads the product's Angular source repo — fetching the file tree and
-individual component files that the architecture agent uses to extract
-screen fields. Write operations from the old QC project are removed;
-this service is read-only.
-"""
-
 import base64
 import logging
 import os

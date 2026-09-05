@@ -1,24 +1,3 @@
-"""
-Settings service for the demo data generator.
-
-One-time settings, internal-office use only — no tenant_id.
-
-Table shape (module mandatory, screen optional):
-
-    module              | screen         | use_domain | use_subdomain | use_geography
-    --------------------+----------------+------------+----------------+---------------
-    Skill Management    | ''             | true       | true           | false   <- module-level default (screen = '')
-    Skill Management    | Skill Domain   | true       | true           | false   <- screen-specific override
-
-Lookup rule:
-    1. Try an exact (module, screen) row.
-    2. Fall back to the module-level default row (screen = '').
-    3. If neither exists, fall back to all-True defaults (nothing disabled).
-
-Settings change roughly once a month, so there is no cache/TTL here —
-every /generate call does one direct SELECT. Saving writes immediately.
-"""
-
 import logging
 import os
 

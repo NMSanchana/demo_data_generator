@@ -1,16 +1,3 @@
-"""
-Static ground truth for the APM Service Resolver — the module manifest
-(module name -> path prefix -> cluster). This plays the same "Level 1
-ground truth" role that the source repo tree plays for the Architecture
-Resolver, except here it's a fixed manifest instead of a fetched tree,
-since APM's module directory isn't itself a JSON endpoint.
-
-Ported from the old build's equivalent module manifest file — content unchanged,
-symbols renamed per the "never name the real ERP system" product decision.
-The document host is read from the APM_DOC_HOST env var rather than
-hardcoded, so no real hostname ever needs to live in source.
-"""
-
 import os
 
 APM_MODULES = [

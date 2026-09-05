@@ -1,13 +1,3 @@
-"""
-Schema cache — keyed on resolved component path(s), so the same screen's
-fields are extracted once and reused on every subsequent request instead of
-being re-fetched and re-parsed from GitLab every time.
-
-Disk-backed JSON (survives process restarts) with an in-memory mirror for
-speed within a running process. Ported/added per Section 5.3 of the
-remediation spec ("port old's cache-store pattern").
-"""
-
 import json
 import logging
 import os

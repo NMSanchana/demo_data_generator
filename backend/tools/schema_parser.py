@@ -1,19 +1,3 @@
-"""
-Deterministic form-field extractor.
-
-This reads the REAL Angular component HTML and finds which fields exist on
-a screen — a mechanical, structural act, not "demo data generation", so it
-is explicitly NOT subject to the "every value must come from an LLM" rule
-(see Section 4 of the remediation spec). Doing this deterministically
-instead of via an LLM call is strictly better here: faster, cheaper, and
-more accurate, since it reads ground truth off the real repo rather than
-asking a model to summarize HTML it just saw once.
-
-Ported from the old build's tools/schema_parser.py — logic unchanged, only
-the "industry_sensitive" flag is renamed to "domain_sensitive" to match the
-Domain/Subdomain field consolidation.
-"""
-
 import re
 
 # Component tags that are NOT form-data fields (actions, layout, grids-of-fields

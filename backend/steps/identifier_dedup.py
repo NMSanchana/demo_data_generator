@@ -1,16 +1,3 @@
-"""
-identifier_dedup_pass — code, NOT generation.
-
-This is a lightweight safety net, not a generation method: if the LLM
-happens to produce the same identifier value twice within one screen's row
-batch, this appends a short disambiguating suffix to the later occurrence.
-It never invents new content and never runs for any field kind other than
-"identifier". Flagged clearly here (and in Section 5.4 of the remediation
-spec) so it's never mistaken for "the code is generating demo data" — the
-one narrow exception point.1 of the spec carves out alongside deterministic
-field discovery.
-"""
-
 import logging
 
 logger = logging.getLogger(__name__)

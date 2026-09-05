@@ -1,11 +1,3 @@
-"""
-Fuzzy-first module/screen matcher against the source repo's file tree.
-
-Ported from the old build's tools/architecture_resolver_fuzzy.py — logic
-unchanged. This runs BEFORE any LLM call; the LLM (Agents/architecture_agent.py)
-is only consulted when this comes back unconfident or ambiguous.
-"""
-
 import logging
 import re
 from dataclasses import dataclass

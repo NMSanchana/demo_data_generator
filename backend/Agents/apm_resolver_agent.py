@@ -1,21 +1,3 @@
-"""
-APM Resolver Agent — two-level resolution: module -> APM path prefix, then
-screen -> real Save* endpoint + request schema, within that module's live
-OpenAPI spec. Fuzzy pass first at each level; LLM fallback only when
-unconfident. Never fabricates a path or endpoint — returns an explicit
-error on total failure.
-
-Ported from the old build's agents/service_resolver_agent.py, renamed per
-the "never name the real ERP product" product decision, switched to async.
-
-Section 3 of the remediation spec moves this resolution to run BEFORE data
-generation (not just at save time) — see steps/apm_schema_resolution.py —
-specifically so the Data Generator Agent can be told the real target type
-of every field. This module also backs the actual /save-row endpoint via
-resolve_apm_schema()'s per-module/screen cache, so a screen resolved during
-/generate is never re-resolved when the person clicks Save.
-"""
-
 import json
 import logging
 import os

@@ -1,14 +1,3 @@
-"""
-Structured, validated geography data: Continent -> Country -> State/Region.
-
-Backed by pycountry / pycountry_convert so the country and state lists are
-real ISO data, not a hand-maintained list. Exposed as real pydantic/Enum
-types in models.py so the API schema (and therefore the OpenAPI docs) shows
-genuine dropdown-able values instead of a free-text string.
-
-Ported from the old build's localedata/geography.py — logic unchanged.
-"""
-
 import re
 import unicodedata
 from enum import Enum

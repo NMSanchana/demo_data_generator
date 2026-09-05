@@ -1,23 +1,3 @@
-"""
-Architecture Agent — resolves a module/screen name against the product's
-Angular source repo.
-
-Fuzzy-first (tools/architecture_resolver_fuzzy.py) — the LLM is only
-consulted when the fuzzy pass is unconfident or ambiguous, and even then
-only sees a pre-filtered slice of the repo tree (filter_tree_by_module),
-never the full multi-thousand-file listing. This directly addresses the
-old regression where every single call sent the entire repo tree to the
-model (Section 2.1 / 5.1 of the remediation spec).
-
-Two responsibilities:
-  1. resolve_screen(module, screen)        -> one screen's component path
-  2. resolve_module_screens(module)        -> every real screen folder
-                                               under that module (blank
-                                               Screen = full-module run)
-Both are also responsible for fetching the resolved file's HTML content,
-since that's always needed immediately after resolution.
-"""
-
 import json
 import logging
 import os

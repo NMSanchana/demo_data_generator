@@ -1,12 +1,3 @@
-"""
-Fuzzy-first resolver for the APM ("APM" = the external ERP save target,
-deliberately never named for real anywhere in this codebase) module +
-Save endpoint + request schema.
-
-Ported from the old build's tools/service_resolver_fuzzy.py, renamed per
-the "never name the real product" product decision. Logic unchanged.
-"""
-
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher

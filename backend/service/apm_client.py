@@ -1,13 +1,3 @@
-"""
-APM client — fetches/caches the live OpenAPI ("swagger") spec for a given
-APM module and executes the actual save POST with the Login header
-attached.
-
-Ported from the old build's equivalent client module, renamed per the
-"never name the real ERP product" product decision, and switched to async
-httpx (this codebase's existing HTTP dependency) instead of requests.
-"""
-
 import logging
 import time
 

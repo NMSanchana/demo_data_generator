@@ -1,19 +1,3 @@
-"""
-Maps a generated/edited preview row into the real APM save-body shape.
-
-Ported from the old build's tools/row_mapper.py, with the type-coercion
-fix that closes the loop on Section 6.3's root-cause fix: knowing a
-field's real type ("integer"/"format":"byte") is necessary but not
-sufficient when that field is actually a fixed system enum — the Data
-Generator Agent may still produce a plausible-sounding label ("Organic
-Farming") for a field whose real valid values are a small closed set
-("Manufacturing"/"Quality"/"Maintenance"/"General"/"Support"). This mapper
-is the second, defensive line: it fuzzy-matches generated text against
-the field's real enum labels (when the swagger spec exposes them — see
-tools/apm_resolver_fuzzy.extract_schema_fields) and only falls back to a
-deterministic stopgap hash when no real enum metadata is available at all.
-"""
-
 import hashlib
 import logging
 from difflib import SequenceMatcher

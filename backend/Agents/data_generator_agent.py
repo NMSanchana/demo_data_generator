@@ -1,26 +1,3 @@
-"""
-Data Generator Agent — generates demo rows for fields that schema
-extraction already found (steps/schema_extraction.py).
-
-No Faker, no random/regex-based content anywhere in this file. The LLM
-owns every field's value for every row, including picklist choices and
-values for fields whose real APM save-schema type is numeric/boolean (it's
-told explicitly what type to produce for those — see Section 6.3 of the
-remediation spec, this is the actual fix for the old byte/integer 400
-error, not a row_mapper patch).
-
-Two entry points:
-  - build_entity_assignment_map(...): ONE shared LLM call per request,
-    asking for a small set of reusable named entities per picklist field
-    that recurs across screens, so full-module runs show the SAME
-    entities on every screen (cross-screen consistency), still
-    agent-generated, just shared across the batch instead of re-invented
-    per screen.
-  - data_generator_agent_node(state): the LangGraph node that generates
-    one screen's row batch, given the shared entity map (if any) and the
-    APM type hints (if APM resolution for this screen succeeded).
-"""
-
 import json
 import logging
 import os
