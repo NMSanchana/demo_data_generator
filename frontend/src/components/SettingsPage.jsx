@@ -112,21 +112,58 @@ export default function SettingsPage() {
         </div>
 
         <div className="checkbox-grid">
-          <CheckboxRow
+          <SettingRow
+            tint="green"
+            icon={
+              <svg viewBox="0 0 20 20" fill="none">
+                <path
+                  d="M4 16V9M10 16V4M16 16v-6"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                />
+              </svg>
+            }
             label="Domain"
             desc="Use the business domain (e.g. Agriculture & Farming) as generation context."
             checked={flags.use_domain}
             onChange={() => toggleFlag("use_domain")}
           />
-          <CheckboxRow
+          <SettingRow
+            tint="pink"
+            icon={
+              <svg viewBox="0 0 20 20" fill="none">
+                <circle cx="10" cy="4.5" r="2" stroke="currentColor" strokeWidth="1.6" />
+                <circle cx="5" cy="15" r="2" stroke="currentColor" strokeWidth="1.6" />
+                <circle cx="15" cy="15" r="2" stroke="currentColor" strokeWidth="1.6" />
+                <path
+                  d="M10 6.5v3M10 9.5 5 13M10 9.5l5 3.5"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeLinecap="round"
+                />
+              </svg>
+            }
             label="Subdomain"
             desc="Use the optional subdomain as generation context, when supplied."
             checked={flags.use_subdomain}
             onChange={() => toggleFlag("use_subdomain")}
           />
-          <CheckboxRow
+          <SettingRow
+            tint="orange"
+            icon={
+              <svg viewBox="0 0 20 20" fill="none">
+                <path
+                  d="M10 18s6-5.2 6-9.6A6 6 0 1 0 4 8.4C4 12.8 10 18 10 18Z"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeLinejoin="round"
+                />
+                <circle cx="10" cy="8.2" r="2" stroke="currentColor" strokeWidth="1.6" />
+              </svg>
+            }
             label="Geography"
-            desc="Use the geography (region/location) as generation context."
+            desc="Use region and location as generation context."
             checked={flags.use_geography}
             onChange={() => toggleFlag("use_geography")}
           />
@@ -147,14 +184,20 @@ export default function SettingsPage() {
   );
 }
 
-function CheckboxRow({ label, desc, checked, onChange }) {
+function SettingRow({ tint, icon, label, desc, checked, onChange }) {
   return (
-    <label className="checkbox-row">
-      <input type="checkbox" checked={checked} onChange={onChange} />
-      <div>
-        <div className="checkbox-label">{label}</div>
-        <div className="checkbox-desc">{desc}</div>
-      </div>
+    <label className={`setting-row setting-row-${tint}`}>
+      <span className="setting-row-icon">{icon}</span>
+      <span className="setting-row-text">
+        <span className="setting-row-label">{label}</span>
+        <span className="setting-row-desc">{desc}</span>
+      </span>
+      <span className="toggle-switch">
+        <input type="checkbox" checked={checked} onChange={onChange} />
+        <span className="toggle-track">
+          <span className="toggle-thumb" />
+        </span>
+      </span>
     </label>
   );
 }

@@ -20,6 +20,8 @@ from service.apm_client import execute_save
 from Agents import architecture_agent
 from Agents.apm_resolver_agent import resolve_apm_schema
 from Agents.data_generator_agent import build_entity_assignment_map
+from Agents.dependency_agent import detect_dependencies
+from service.testdb_client import fetch_master_values
 from steps import schema_extraction
 from steps.apm_schema_resolution import resolve_for_generation
 from tools.row_mapper import map_row_to_schema
@@ -119,6 +121,116 @@ async def _resolve_screens(module: str, screen: str | None) -> list[dict]:
     return await architecture_agent.resolve_module_screens(module)
 
 
+def _values_from_master_rows(
+    master_rows: list[dict],
+    master_field_name: str | None,
+    master_fields_schema: list[dict],
+    dependent_field_name: str,
+) -> list[str]:
+    """
+    Pull real, distinct values out of a master screen's already-generated
+    rows for use by a dependent field elsewhere. Tries, in order: the
+    agent-suggested master_field_name (if it's actually a key on the
+    generated rows), the master screen's own "identifier"-kind field, the
+    dependent field's own name (in case both screens happen to share it),
+    then simply the first column present -- never raises, returns [] if
+    nothing usable is found.
+    """
+    if not master_rows:
+        return []
+
+    first_row = master_rows[0]
+    candidate_field = master_field_name if master_field_name in first_row else None
+
+    if candidate_field is None:
+        identifier_fields = [f["field_name"] for f in master_fields_schema if f.get("kind") == "identifier"]
+        if identifier_fields and identifier_fields[0] in first_row:
+            candidate_field = identifier_fields[0]
+
+    if candidate_field is None and dependent_field_name in first_row:
+        candidate_field = dependent_field_name
+
+    if candidate_field is None:
+        candidate_field = next(iter(first_row), None)
+
+    if candidate_field is None:
+        return []
+
+    values: list[str] = []
+    seen: set[str] = set()
+    for row in master_rows:
+        value = row.get(candidate_field)
+        if value is None:
+            continue
+        value_str = str(value)
+        if value_str not in seen:
+            seen.add(value_str)
+            values.append(value_str)
+
+    return values
+
+
+async def _resolve_dependency_field_values(
+    module: str,
+    dependencies: list[dict],
+    generated_rows_by_screen: dict[str, list[dict]],
+    fields_by_screen: dict[str, list[dict]],
+) -> dict[str, list[str]]:
+    """
+    Implements the three-tier fallback for every field this screen's
+    dependency_agent call flagged as referencing another screen:
+
+      1. Reuse that other screen's rows if they were already generated
+         earlier in this same request.
+      2. Otherwise, look up real, currently-existing values in the real
+         TESTDB (service/testdb_client.py) -- engine-agnostic, fuzzy table/
+         column matching, never raises.
+      3. Otherwise, this field is simply omitted from the returned dict --
+         Agents/data_generator_agent.py generates it exactly as before
+         (invented), with no error and no interruption.
+    """
+    dependency_field_values: dict[str, list[str]] = {}
+
+    for dep in dependencies:
+        field_name = dep["field_name"]
+        master_screen = dep["depends_on_screen"]
+        master_field_name = dep.get("master_field_name")
+
+        # Tier 1 -- reuse in-run generated data, if the master screen has
+        # already produced rows earlier in this same request's loop.
+        master_rows = generated_rows_by_screen.get(master_screen)
+        if master_rows:
+            values = _values_from_master_rows(
+                master_rows, master_field_name, fields_by_screen.get(master_screen, []), field_name,
+            )
+            if values:
+                dependency_field_values[field_name] = values
+                continue
+
+        # Tier 2 -- real TESTDB lookup. Never allowed to raise or block.
+        try:
+            values = await fetch_master_values(master_screen, master_field_name or field_name)
+        except Exception:
+            logger.exception(
+                "testdb_client crashed resolving %s/%s -- falling back to invented value",
+                master_screen, master_field_name or field_name,
+            )
+            values = None
+
+        if values:
+            dependency_field_values[field_name] = values
+            continue
+
+        # Tier 3 -- neither available; leave this field out entirely so
+        # data_generator_agent invents it exactly as it does today.
+        logger.info(
+            "dependency fallback: no in-run data or TESTDB match for %s -> %s/%s -- inventing as usual",
+            field_name, master_screen, master_field_name or field_name,
+        )
+
+    return dependency_field_values
+
+
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(request: GenerateRequest):
     settings = await settings_service.get_settings(request.module, request.screen)
@@ -168,6 +280,27 @@ async def generate(request: GenerateRequest):
         first_error = next((c["error"] for c in screen_contexts if not c["ok"]), "Generation failed.")
         raise HTTPException(status_code=422, detail=first_error)
 
+    # Phase 1.5: dependency detection — for every resolved screen, ask
+    # Agents/dependency_agent.py (LLM-based reasoning over that screen's
+    # own field list, given the names of every other screen resolved in
+    # this same request) whether any field is a foreign-key-like reference
+    # into another screen's master data. This never blocks generation: a
+    # screen with no detected dependencies (or a failed/empty LLM call)
+    # just gets an empty dependency list, and generates exactly as before.
+    ok_screen_names = [c["screen_name"] for c in screen_contexts if c["ok"]]
+    fields_by_screen: dict[str, list[dict]] = {c["screen_name"]: c["fields"] for c in screen_contexts if c["ok"]}
+
+    for ctx in screen_contexts:
+        if not ctx["ok"]:
+            continue
+        other_screens = [name for name in ok_screen_names if name != ctx["screen_name"]]
+        try:
+            dependency_result = await detect_dependencies(ctx["screen_name"], ctx["fields"], other_screens)
+        except Exception:
+            logger.exception("dependency_agent crashed for %s/%s -- treating as no dependencies", request.module, ctx["screen_name"])
+            dependency_result = {"dependencies": []}
+        ctx["dependencies"] = dependency_result.get("dependencies", [])
+
     # Phase 2: ONE shared entity-assignment call across every resolved
     # screen's picklist fields (cross-screen consistency for full-module runs).
     picklist_field_names = sorted({
@@ -192,6 +325,14 @@ async def generate(request: GenerateRequest):
     geography_for_next_screen = raw_geography
     geography_resolved_yet = False
 
+    # Accumulates each screen's rows as they're generated, so a later
+    # screen in this same loop whose dependency_agent result points at an
+    # earlier screen can reuse its real generated data (see
+    # _resolve_dependency_field_values's Tier 1). Screens that fail, or
+    # that are processed before their master screen resolves, simply fall
+    # through to Tier 2 (TESTDB) or Tier 3 (invent) below.
+    generated_rows_by_screen: dict[str, list[dict]] = {}
+
     results: list[ScreenResult] = []
     for ctx in screen_contexts:
         if not ctx["ok"]:
@@ -200,6 +341,10 @@ async def generate(request: GenerateRequest):
 
         apm_resolution = ctx["apm_resolution"]
         apm_ready = bool(apm_resolution.get("ok"))
+
+        dependency_field_values = await _resolve_dependency_field_values(
+            request.module, ctx.get("dependencies", []), generated_rows_by_screen, fields_by_screen,
+        )
 
         initial_state = {
             "module": request.module,
@@ -215,6 +360,7 @@ async def generate(request: GenerateRequest):
             "generated_fields": ctx["fields"],
             "apm_type_hints": apm_resolution.get("scalar_fields", {}) if apm_ready else {},
             "entity_assignment_map": entity_assignment_map,
+            "dependency_field_values": dependency_field_values,
         }
 
         try:
@@ -233,6 +379,7 @@ async def generate(request: GenerateRequest):
             geography_resolved_yet = True
 
         rows = final_state.get("generated_rows") or []
+        generated_rows_by_screen[ctx["screen_name"]] = rows
         results.append(ScreenResult(
             status="ok",
             screen=ctx["screen_name"],

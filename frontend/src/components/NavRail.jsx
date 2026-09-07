@@ -10,8 +10,18 @@ export default function NavRail({ page, onNavigate, loginVersion, onLoginChange 
     <>
       <nav className="nav-rail">
         <div className="nav-brand">
-          Demo Data Generator
-          <span>Domain &amp; geography aware, internal tool</span>
+          <div className="nav-brand-icon">
+            <svg viewBox="0 0 24 24" fill="none">
+              <path
+                d="M12 2.5 14 9l6.5 2-6.5 2-2 6.5-2-6.5L3.5 11 10 9l2-6.5Z"
+                fill="currentColor"
+              />
+            </svg>
+          </div>
+          <div className="nav-brand-text">
+            Demo data generator
+            <span>Domain &amp; geography aware</span>
+          </div>
         </div>
 
         <button
@@ -67,8 +77,6 @@ export default function NavRail({ page, onNavigate, loginVersion, onLoginChange 
             <span className={`nav-login-dot ${loginSummary() ? "ok" : "missing"}`} />
           </span>
         </button>
-
-        <div className="nav-footer">v3.0.0</div>
       </nav>
 
       {drawerOpen && (

@@ -37,6 +37,18 @@ class GeneratorState(TypedDict, total=False):
     # picklist fields -- {} if there were no picklist fields anywhere.
     entity_assignment_map: dict
 
+    # Resolved by main.py per screen, BEFORE this graph runs, using
+    # Agents/dependency_agent.py's LLM-based dependency detection plus
+    # either in-run generated rows or service/testdb_client.py's real
+    # TESTDB lookup (see main.py's Phase 1.5 / Phase 3 wiring). Maps a
+    # field_name on THIS screen to a list of real, already-existing values
+    # it must be drawn from -- e.g. {"SkillDomainCode": ["AGRI-DOM-001",
+    # "AGRI-DOM-002"]}. Empty ({}) when this screen has no detected
+    # dependencies, or when a dependency was detected but neither in-run
+    # data nor TESTDB had anything usable for it -- in either case
+    # generation proceeds exactly as before (the field is invented).
+    dependency_field_values: dict
+
     # --- Data generator agent outputs ---
     generated_rows:      list[dict]
     resolved_geography:  str | None   # what geography text was resolved to, e.g.
