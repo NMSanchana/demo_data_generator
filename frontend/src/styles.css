@@ -769,11 +769,6 @@ table.data-table td input[type="checkbox"] {
   color: var(--color-danger);
 }
 
-.apm-warn {
-  background: var(--color-warn-wash);
-  border-color: var(--color-warn);
-  color: var(--color-warn);
-}
 
 .apm-idle {
   color: var(--color-ink-faint);

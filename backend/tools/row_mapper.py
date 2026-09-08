@@ -53,8 +53,22 @@ def _coerce_value(field_name: str, value, field_schema: dict):
                     return enum_values[match_index]
                 return match_index
 
-        # Tier 3 — genuinely no information available anywhere. Small,
-        # biased guess, clearly logged as such.
+        # Tier 3 — genuinely no label match found. Still, if we know the
+        # field's real enum domain (e.g. DomainType: 0-4), a guess MUST
+        # stay inside that domain or APM will reject the save outright
+        # ("DomainType must be 0-4 ...") -- worse than just being
+        # semantically wrong. Only fall back to the generic ceiling when
+        # nothing about the field's valid range is known at all.
+        if enum_values:
+            logger.warning(
+                "row_mapper: field %r has enum values %r but %r didn't match any "
+                "label — guessing a value FROM the real enum domain, still NOT "
+                "semantically correct",
+                field_name, enum_values, value,
+            )
+            index = _stable_index_for_text(value, len(enum_values))
+            return enum_values[index]
+
         logger.warning(
             "row_mapper: field %r has no enum metadata to match %r against — "
             "guessing a small integer, value will NOT be semantically correct",
@@ -142,12 +156,16 @@ async def map_row_to_schema(row: dict, scalar_fields: dict, screen_name: str) ->
         "unmatched_frontend_fields": list[str], # row keys never matched to an APM field
       }
 
-    Matching order per APM field: exact name match against `row` first;
-    if that misses, fuzzy-match against whatever `row` keys are still
-    unclaimed (see tools.apm_resolver_fuzzy.resolve_field_name, same
-    string-similarity technique already used for module/endpoint
-    resolution, ~75%+ confidence). Anything still unmatched on either side
-    is reported rather than silently dropped.
+    Matching happens in two passes so exact matches always win regardless
+    of field order:
+      Pass 1 -- claim every EXACT name match, across ALL fields, first.
+      Pass 2 -- fuzzy-match only fields that had no exact match, against
+                whatever row keys are still unclaimed (see
+                tools.apm_resolver_fuzzy.resolve_field_name, same
+                string-similarity technique already used for
+                module/endpoint resolution, ~75%+ confidence).
+    Anything still unmatched on either side is reported (logged) rather
+    than silently dropped.
     """
     body: dict = {}
     missing_required_fields: list[str] = []
@@ -158,20 +176,40 @@ async def map_row_to_schema(row: dict, scalar_fields: dict, screen_name: str) ->
     # frontend field or gets fuzzy-matched against.
     remaining_row_keys = {k for k in row.keys() if k != "needs_review"}
 
+    # Pass 1 -- claim every EXACT name match first, across ALL fields,
+    # before any fuzzy matching happens. This has to be a separate pass:
+    # if fuzzy-matching ran interleaved with exact-matching (one field at
+    # a time, in whatever order scalar_fields happens to iterate in), an
+    # earlier field with NO exact match could fuzzy-steal a row key that
+    # was actually the perfect exact match for a field processed later
+    # (e.g. an unrelated field like "SkillDomainCode" fuzzy-matching
+    # against row key "DomainCode" before the real "DomainCode" schema
+    # field gets its turn) -- silently breaking a save that used to work.
+    field_matches: dict[str, str] = {}
+    unresolved_fields: list[str] = []
+    for field_name in scalar_fields:
+        if field_name in row and field_name in remaining_row_keys:
+            field_matches[field_name] = field_name
+            remaining_row_keys.discard(field_name)
+        else:
+            unresolved_fields.append(field_name)
+
+    # Pass 2 -- fuzzy-match only the fields that had no exact match, only
+    # against row keys no exact match already claimed.
+    for field_name in unresolved_fields:
+        fuzzy_match = fuzzy.resolve_field_name(field_name, sorted(remaining_row_keys))
+        if fuzzy_match is not None:
+            matched_key, confidence = fuzzy_match
+            logger.info(
+                "row_mapper: fuzzy-matched APM field %r to frontend field %r (confidence=%.2f)",
+                field_name, matched_key, confidence,
+            )
+            field_matches[field_name] = matched_key
+            remaining_row_keys.discard(matched_key)
+
     for field_name, field_schema in scalar_fields.items():
         field_schema = field_schema or {}
-        matched_key = None
-
-        if field_name in row and field_name in remaining_row_keys:
-            matched_key = field_name
-        else:
-            fuzzy_match = fuzzy.resolve_field_name(field_name, sorted(remaining_row_keys))
-            if fuzzy_match is not None:
-                matched_key, confidence = fuzzy_match
-                logger.info(
-                    "row_mapper: fuzzy-matched APM field %r to frontend field %r (confidence=%.2f)",
-                    field_name, matched_key, confidence,
-                )
+        matched_key = field_matches.get(field_name)
 
         if matched_key is None:
             unmatched_apm_fields.append(field_name)
@@ -179,7 +217,6 @@ async def map_row_to_schema(row: dict, scalar_fields: dict, screen_name: str) ->
                 missing_required_fields.append(field_name)
             continue
 
-        remaining_row_keys.discard(matched_key)
         value = _coerce_value(field_name, row[matched_key], field_schema)
         _validate_constraints(field_name, value, field_schema)
 
