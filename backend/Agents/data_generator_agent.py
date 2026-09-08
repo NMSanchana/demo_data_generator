@@ -136,7 +136,12 @@ def _build_user_message(state: dict) -> str:
         parts.append(
             "apm_field_types (the REAL save-target type for these field names -- "
             "generate a value of exactly this type, not display text, for any "
-            "field listed here):"
+            "field listed here. Each entry may also carry: is_required (true "
+            "means APM will reject the save if this field is left blank -- "
+            "never leave it empty); and value-shape constraints APM enforces "
+            "-- maxLength/minLength (character count), pattern (a regex the "
+            "value must match), minimum/maximum (numeric range). Respect all "
+            "of these when generating a value for a field that has them):"
         )
         parts.append(json.dumps(apm_type_hints))
 

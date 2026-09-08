@@ -9,11 +9,17 @@ const ROW_STATE = { IDLE: "idle", SAVING: "saving", OK: "ok", ERROR: "error" };
 /**
  * One screen's generation result: header with status, an editable table
  * of the generated rows (the only output surface — there is no export),
- * and a per-row Save-to-APM flow with ✓/✗ status per row.
+ * and a per-row Save-to-APM flow with ✓/⚠/✗ status per row.
  *
  * `result` shape (matches ScreenResult in backend/models.py):
  *   { status, message, screen, resolved_path, fields, rows, row_count,
  *     apm_ready, apm_disabled_reason }
+ *
+ * Per-row save responses (matches SaveRowResponse in backend/models.py)
+ * may also carry missing_required_fields / unmatched_apm_fields /
+ * unmatched_frontend_fields — surfaced here as a warning (⚠) state even
+ * when the save itself succeeded, so a likely-to-fail or silently-dropped
+ * field is visible instead of vanishing quietly.
  */
 export default function ResultPanel({ module, result }) {
   const { bumpLoginVersion } = useApp();
@@ -53,14 +59,31 @@ export default function ResultPanel({ module, result }) {
     });
   }
 
+  function buildWarning(res) {
+    const parts = [];
+    if (res.missing_required_fields?.length) {
+      parts.push(`Missing required APM fields: ${res.missing_required_fields.join(", ")}`);
+    }
+    if (res.unmatched_apm_fields?.length) {
+      parts.push(`APM fields with no match in this row: ${res.unmatched_apm_fields.join(", ")}`);
+    }
+    if (res.unmatched_frontend_fields?.length) {
+      parts.push(`Row fields not sent to APM (no matching schema field): ${res.unmatched_frontend_fields.join(", ")}`);
+    }
+    return parts.length ? parts.join(" · ") : null;
+  }
+
   async function saveOneRow(rowIndex) {
     const row = rows[rowIndex];
     setRowStatus((s) => ({ ...s, [rowIndex]: { state: ROW_STATE.SAVING } }));
     try {
       const res = await saveRow(getLogin(), { module, screen: result.screen, row });
+      const warning = buildWarning(res);
       setRowStatus((s) => ({
         ...s,
-        [rowIndex]: res.ok ? { state: ROW_STATE.OK } : { state: ROW_STATE.ERROR, error: res.error || "Save failed" },
+        [rowIndex]: res.ok
+          ? { state: ROW_STATE.OK, warning }
+          : { state: ROW_STATE.ERROR, error: res.error || "Save failed", warning },
       }));
     } catch (e) {
       setRowStatus((s) => ({ ...s, [rowIndex]: { state: ROW_STATE.ERROR, error: e.message } }));
@@ -136,9 +159,9 @@ export default function ResultPanel({ module, result }) {
                 const entry = rowStatus[rowIndex];
                 return (
                   <tr key={rowIndex}>
-                    <td className="apm-status-col" title={entry?.error || ""}>
+                    <td className="apm-status-col" title={entry?.error || entry?.warning || ""}>
                       {st === ROW_STATE.SAVING && <span className="apm-row-status spinner" />}
-                      {st === ROW_STATE.OK && (
+                      {st === ROW_STATE.OK && !entry?.warning && (
                         <button
                           type="button"
                           className="apm-row-status apm-tick"
@@ -148,11 +171,25 @@ export default function ResultPanel({ module, result }) {
                           ✓
                         </button>
                       )}
+                      {st === ROW_STATE.OK && entry?.warning && (
+                        <button
+                          type="button"
+                          className="apm-row-status apm-warn"
+                          title={`Saved with warnings — ${entry.warning}`}
+                          onClick={() => saveOneRow(rowIndex)}
+                        >
+                          ⚠
+                        </button>
+                      )}
                       {st === ROW_STATE.ERROR && (
                         <button
                           type="button"
                           className="apm-row-status apm-cross"
-                          title={entry?.error ? `${entry.error} — click to retry` : "Failed — click to retry"}
+                          title={
+                            entry?.error
+                              ? `${entry.error}${entry.warning ? ` — ${entry.warning}` : ""} — click to retry`
+                              : "Failed — click to retry"
+                          }
                           onClick={() => saveOneRow(rowIndex)}
                         >
                           ✗

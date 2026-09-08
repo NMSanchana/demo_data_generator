@@ -262,10 +262,13 @@ async def save_row(request: SaveRowRequest, raw_request: Request):
     if not resolution.get("ok"):
         return SaveRowResponse(ok=False, error=resolution.get("error"))
 
-    body = await map_row_to_schema(request.row, resolution["scalar_fields"], request.screen)
-    result = await execute_save(resolution["path_prefix"], resolution["endpoint_path"], login_header, body)
+    mapping = await map_row_to_schema(request.row, resolution["scalar_fields"], request.screen)
+    result = await execute_save(resolution["path_prefix"], resolution["endpoint_path"], login_header, mapping["body"])
 
     return SaveRowResponse(
         ok=result["ok"], status_code=result["status_code"],
         error=result["error"], response=result["response"],
+        missing_required_fields=mapping["missing_required_fields"],
+        unmatched_apm_fields=mapping["unmatched_apm_fields"],
+        unmatched_frontend_fields=mapping["unmatched_frontend_fields"],
     )

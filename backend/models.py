@@ -89,3 +89,22 @@ class SaveRowResponse(BaseModel):
     status_code: int | None = None
     error:       str | None = None
     response:    Any = None
+    missing_required_fields: list[str] = Field(
+        default_factory=list,
+        description="APM-required fields (per swagger.json 'required') that were "
+                     "absent or empty in this row. Save is still attempted -- this "
+                     "is a warning, not a hard block -- but APM itself is likely "
+                     "to reject the save if this list is non-empty.",
+    )
+    unmatched_apm_fields: list[str] = Field(
+        default_factory=list,
+        description="APM schema fields that had no exact or fuzzy-matched "
+                     "counterpart anywhere in the submitted row, so nothing was "
+                     "sent for them.",
+    )
+    unmatched_frontend_fields: list[str] = Field(
+        default_factory=list,
+        description="Keys present in the submitted row that didn't match any "
+                     "APM schema field (exactly or fuzzily), so they were dropped "
+                     "from the save body.",
+    )
