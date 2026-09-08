@@ -48,18 +48,6 @@ You will be given:
   "Closed"]}. When a field name appears here, ONLY use values from that
   exact pool (do not invent alternatives), so the same named entities stay
   consistent across every screen in this request.
-- dependency_field_values (optional): for some fields, a fixed list of
-  REAL, currently-existing values that field must be drawn from — e.g.
-  {"SkillDomainCode": ["AGRI-DOM-001", "AGRI-DOM-002", "AGRI-DOM-003"]}.
-  These fields are foreign-key-like references into another screen's real
-  master data (either already generated in this same run, or pulled live
-  from the real test database) — NOT vocabulary you invent. When a field
-  name appears here, you MUST use ONLY the exact values listed, cycling
-  through them across rows as needed (repeats are fine and expected if
-  row_count exceeds the number of available values). This takes priority
-  over any other formatting guidance for that field (e.g. its "kind" would
-  otherwise suggest an invented code) — the value must correspond to a
-  real referenced record, not merely look plausible.
 - fields: the already-extracted form fields for this screen (field_name,
   kind, selector) — produced by a separate, deterministic extraction step.
   Do NOT re-extract fields from HTML; use exactly this list.

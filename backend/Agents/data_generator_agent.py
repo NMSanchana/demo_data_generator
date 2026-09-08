@@ -155,27 +155,6 @@ def _build_user_message(state: dict) -> str:
         )
         parts.append(json.dumps(relevant_pools))
 
-    # Resolved by Agents/dependency_agent.py + main.py's Phase 1.5/Phase 3
-    # wiring: this screen's field(s) that were determined to reference
-    # another screen's master data, together with that master data's real,
-    # currently-existing values (either reused from this same run, or
-    # pulled live from the real TESTDB -- never invented). See
-    # workflow/state.py for the exact provenance rules.
-    dependency_field_values = state.get("dependency_field_values") or {}
-    if dependency_field_values:
-        parts.append("")
-        parts.append(
-            "dependency_field_values (these fields are foreign-key-like "
-            "references into another screen's REAL, currently-existing "
-            "records -- you MUST use ONLY the values listed here for the "
-            "matching field, cycling through them across rows as needed. "
-            "Do not invent alternative values for these specific fields, "
-            "even if they don't look like the rest of the field's usual "
-            "vocabulary -- they must correspond to a real referenced "
-            "record):"
-        )
-        parts.append(json.dumps(dependency_field_values))
-
     parts.append("")
     parts.append("fields:")
     parts.append(json.dumps(fields))
@@ -197,8 +176,7 @@ async def data_generator_agent_node(state: dict) -> dict:
       state["row_count"], state["domain"], state["subdomain"],
       state["geography"], state["geography_already_resolved"],
       state["use_domain"], state["use_subdomain"], state["use_geography"],
-      state["apm_type_hints"], state["entity_assignment_map"],
-      state["dependency_field_values"]
+      state["apm_type_hints"], state["entity_assignment_map"]
 
     Writes:
       state["generated_rows"]     — list of row dicts (one per demo record)
