@@ -97,9 +97,65 @@ def resolve_save_endpoint(spec: dict, screen_query: str) -> ResolvedEndpoint | N
 _CONSTRAINT_KEYS = ("maxLength", "minLength", "pattern", "minimum", "maximum")
 
 
+def _parse_enum_from_description(description: str) -> tuple[list[int], list[str]] | None:
+    """
+    Best-effort recovery of enum value/label pairs when the swagger
+    property has NO formal "enum" array and NO x-enumNames/x-ms-enum
+    vendor extension -- only a human-readable description string.
+
+    This is common for internal .NET APIs: a byte-backed enum field gets
+    validated by hand in the controller (e.g. "DomainType must be 0-4
+    (Manufacturing/Quality/Maintenance/General/Support)"), and Swashbuckle
+    only ever exports that same phrase as free-text "description" on the
+    property -- never as a real OpenAPI "enum" constraint. Confirmed via
+    logs: 'DomainType' hits the "no enum metadata" branch on every single
+    row, meaning the formal enum truly isn't present -- not a parsing miss
+    on a specific value.
+
+    Handles two shapes, tried in order:
+
+    1. "0=Manufacturing, 1=Quality, 2=Maintenance" -- explicit value=label
+       pairs, comma or semicolon separated. Most reliable when present,
+       since it states the exact value for each label directly.
+
+    2. "must be 0-4 (Manufacturing/Quality/Maintenance/General/Support)"
+       -- a numeric range PLUS a slash-separated label list. Labels are
+       assumed to map sequentially onto the range, starting at its lower
+       bound (index 0 of the label list -> range start, index 1 -> range
+       start + 1, etc.) -- this matches how these messages are always
+       phrased in this codebase's target APM.
+
+    Returns (values, labels) with values/labels in matching order, or
+    None if neither shape is recognizable in the text.
+    """
+    if not description:
+        return None
+
+    # Shape 1 -- explicit "N=Label" pairs.
+    pairs = re.findall(r"(\d+)\s*=\s*([A-Za-z][A-Za-z0-9 _-]*)", description)
+    if len(pairs) >= 2:
+        values = [int(v) for v, _ in pairs]
+        labels = [label.strip() for _, label in pairs]
+        return values, labels
+
+    # Shape 2 -- numeric range + slash-separated label list in parentheses.
+    range_match = re.search(r"(\d+)\s*-\s*(\d+)", description)
+    labels_match = re.search(r"\(([A-Za-z][A-Za-z0-9 _/-]*)\)", description)
+    if range_match and labels_match:
+        start = int(range_match.group(1))
+        end = int(range_match.group(2))
+        labels = [part.strip() for part in labels_match.group(1).split("/") if part.strip()]
+        if labels and len(labels) == (end - start + 1):
+            values = list(range(start, end + 1))
+            return values, labels
+
+    return None
+
+
 def extract_schema_fields(spec: dict, schema_name: str) -> dict:
     """Top-level scalar fields only (name -> {type, format, is_required
-    [, maxLength, minLength, pattern, minimum, maximum][, enum, enum_labels]})
+    [, maxLength, minLength, pattern, minimum, maximum][, enum, enum_labels]
+    [, enum_source]})
     — enough to know which generated row keys map directly onto the save
     body, AND (critically, see Section 6.3) enough to tell the Data
     Generator Agent the real target type of each field before generation
@@ -110,11 +166,16 @@ def extract_schema_fields(spec: dict, schema_name: str) -> dict:
     Fixed-value byte/int fields (C# enums) are frequently exported by
     Swashbuckle/NSwag as an "enum" list of numeric codes, with the
     human-readable names alongside under one of a few vendor extension
-    keys. Capture both when present — without this, a field like
-    DomainType (0-4: Manufacturing/Quality/Maintenance/General/Support)
-    looks like a plain byte and gets treated as free-text domain
-    vocabulary, which is wrong: it's a fixed system enum, not something
-    that varies by domain.
+    keys. Capture both when present.
+
+    Some internal APIs (confirmed for DomainType on this APM instance via
+    server logs -- see _parse_enum_from_description docstring) don't emit
+    any of those at all, and only document the valid values inside a
+    free-text "description" string. When no formal enum info is found, we
+    fall back to best-effort parsing that description. `enum_source` on
+    the returned field_meta says which path supplied the enum info
+    ("schema" | "description" | absent if neither worked), purely for
+    debugging/logging -- never required by callers.
 
     Two more things the same swagger schema already carries but which
     used to be ignored:
@@ -140,26 +201,41 @@ def extract_schema_fields(spec: dict, schema_name: str) -> dict:
             nested_fields.append(name)
             continue
 
+        description = prop.get("description")
         field_meta = {
             "type": prop.get("type"),
             "format": prop.get("format"),
             "is_required": name in required_fields,
         }
+        if description:
+            field_meta["description"] = description
 
         for constraint_key in _CONSTRAINT_KEYS:
             if constraint_key in prop:
                 field_meta[constraint_key] = prop[constraint_key]
 
         enum_values = prop.get("enum")
+        enum_labels = None
         if enum_values:
             enum_labels = (
                 prop.get("x-enumNames")
                 or prop.get("x-enum-varnames")
                 or prop.get("x-ms-enum", {}).get("values")
             )
+            field_meta["enum_source"] = "schema"
+        elif description:
+            # No formal enum on the property at all -- try to recover it
+            # from the description text before giving up (see docstring
+            # on _parse_enum_from_description for why this is needed).
+            recovered = _parse_enum_from_description(description)
+            if recovered:
+                enum_values, enum_labels = recovered
+                field_meta["enum_source"] = "description"
+
+        if enum_values:
             field_meta["enum"] = enum_values
-            if enum_labels:
-                field_meta["enum_labels"] = enum_labels
+        if enum_labels:
+            field_meta["enum_labels"] = enum_labels
 
         scalar_fields[name] = field_meta
 
