@@ -111,7 +111,7 @@ async def _resolve_uncached(module_query: str, screen_query: str) -> dict:
         if endpoint_match is None:
             return {"ok": False, "error": f"Could not resolve screen '{screen_query}' to a Save endpoint under module '{module_match.module}'."}
 
-    field_info = fuzzy.extract_schema_fields(spec, endpoint_match.schema_name)
+    field_info = await fuzzy.extract_schema_fields(spec, endpoint_match.schema_name)
 
     return {
         "ok": True,

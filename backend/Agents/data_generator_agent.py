@@ -52,10 +52,6 @@ async def _ask_llm_json(system_prompt: str, user_message: str, temperature: floa
         return {"error": str(e)}
 
 
-# --------------------------------------------------------------------
-# Shared entity assignment — one call per request, not per screen
-# --------------------------------------------------------------------
-
 async def build_entity_assignment_map(
     module: str,
     domain: str | None,
@@ -63,16 +59,6 @@ async def build_entity_assignment_map(
     geography: str | None,
     picklist_field_names: list[str],
 ) -> dict[str, list[str]]:
-    """
-    Asks the LLM for a small reusable pool of named entities per picklist
-    field name, once per request, so every screen in a full-module run
-    that shares a picklist field name (e.g. "Status", "Department") shows
-    the SAME entity pool rather than each screen inventing its own.
-
-    `geography` here is whatever raw text the user typed -- this call
-    doesn't need the fully-resolved place name, just enough context to
-    flavor naming, so it runs before geography resolution has happened.
-    """
     if not picklist_field_names:
         return {}
 
@@ -98,16 +84,7 @@ async def build_entity_assignment_map(
     return {k: v for k, v in pools.items() if isinstance(v, list) and v}
 
 
-# --------------------------------------------------------------------
-# Per-screen row generation (+ geography resolution, first screen only)
-# --------------------------------------------------------------------
-
 def _build_user_message(state: dict) -> str:
-    """
-    Only include domain/subdomain/geography when their settings flag is
-    True. A disabled component must never reach the agent, even if the
-    frontend sent a value for it.
-    """
     row_count = state.get("row_count") or DEFAULT_ROW_COUNT
     fields = state.get("generated_fields") or []
 
@@ -145,6 +122,20 @@ def _build_user_message(state: dict) -> str:
         )
         parts.append(json.dumps(apm_type_hints))
 
+        fk_options_block = {
+            field_name: field_meta["fk_options"]
+            for field_name, field_meta in apm_type_hints.items()
+            if field_meta.get("fk_options")
+        }
+        if fk_options_block:
+            parts.append("")
+            parts.append(
+                "apm_fk_options (for these fields, you MUST pick one of the "
+                "real id values listed here, matched to whichever option "
+                "best fits the row's context -- never invent a new id):"
+            )
+            parts.append(json.dumps(fk_options_block))
+
     entity_assignment_map = state.get("entity_assignment_map") or {}
     relevant_pools = {
         f["field_name"]: entity_assignment_map[f["field_name"]]
@@ -168,27 +159,6 @@ def _build_user_message(state: dict) -> str:
 
 
 async def data_generator_agent_node(state: dict) -> dict:
-    """
-    LangGraph node — generates demo rows for the fields schema extraction
-    already found, using only the enabled components. When geography is
-    enabled and hasn't been resolved yet this request (see
-    state["geography_already_resolved"]), this call also resolves the
-    typed geography text to a real place and returns it as
-    resolved_geography.
-
-    Reads:
-      state["generated_fields"], state["module"], state["screen"],
-      state["row_count"], state["domain"], state["subdomain"],
-      state["geography"], state["geography_already_resolved"],
-      state["use_domain"], state["use_subdomain"], state["use_geography"],
-      state["apm_type_hints"], state["entity_assignment_map"]
-
-    Writes:
-      state["generated_rows"]     — list of row dicts (one per demo record)
-      state["resolved_geography"] — str | None, only meaningful when
-                                     geography is enabled
-      state["generation_error"]   — str | None
-    """
     fields = state.get("generated_fields") or []
     if not fields:
         return {
@@ -218,10 +188,6 @@ async def data_generator_agent_node(state: dict) -> dict:
 
     resolved_geography = None
     if state.get("use_geography", True) and state.get("geography"):
-        # Fall back to the raw input if the model omitted it for some
-        # reason -- worst case the "resolved" value is just what was
-        # typed, which is still correct behavior (unresolvable input
-        # should never block generation).
         resolved_geography = result.get("resolved_geography") or state["geography"]
 
     logger.info("data_generator_agent_node: generated %d row(s)", len(rows))

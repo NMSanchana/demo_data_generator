@@ -1,8 +1,13 @@
+import logging
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
 from localedata.apm_modules import APM_MODULES
+from service import testdb_client
+from tools.fk_resolver import resolve_fk_field
+
+logger = logging.getLogger(__name__)
 
 MODULE_MIN_CONFIDENCE = 0.5
 ENDPOINT_MIN_CONFIDENCE = 0.45
@@ -90,55 +95,19 @@ def resolve_save_endpoint(spec: dict, screen_query: str) -> ResolvedEndpoint | N
     )
 
 
-# Format/range constraint keys carried straight through from the swagger
-# field schema, when present, onto the returned field_meta dict. These are
-# used both as generation hints for the LLM and as a save-time safety net
-# (see row_mapper._validate_constraints).
 _CONSTRAINT_KEYS = ("maxLength", "minLength", "pattern", "minimum", "maximum")
 
 
 def _parse_enum_from_description(description: str) -> tuple[list[int], list[str]] | None:
-    """
-    Best-effort recovery of enum value/label pairs when the swagger
-    property has NO formal "enum" array and NO x-enumNames/x-ms-enum
-    vendor extension -- only a human-readable description string.
-
-    This is common for internal .NET APIs: a byte-backed enum field gets
-    validated by hand in the controller (e.g. "DomainType must be 0-4
-    (Manufacturing/Quality/Maintenance/General/Support)"), and Swashbuckle
-    only ever exports that same phrase as free-text "description" on the
-    property -- never as a real OpenAPI "enum" constraint. Confirmed via
-    logs: 'DomainType' hits the "no enum metadata" branch on every single
-    row, meaning the formal enum truly isn't present -- not a parsing miss
-    on a specific value.
-
-    Handles two shapes, tried in order:
-
-    1. "0=Manufacturing, 1=Quality, 2=Maintenance" -- explicit value=label
-       pairs, comma or semicolon separated. Most reliable when present,
-       since it states the exact value for each label directly.
-
-    2. "must be 0-4 (Manufacturing/Quality/Maintenance/General/Support)"
-       -- a numeric range PLUS a slash-separated label list. Labels are
-       assumed to map sequentially onto the range, starting at its lower
-       bound (index 0 of the label list -> range start, index 1 -> range
-       start + 1, etc.) -- this matches how these messages are always
-       phrased in this codebase's target APM.
-
-    Returns (values, labels) with values/labels in matching order, or
-    None if neither shape is recognizable in the text.
-    """
     if not description:
         return None
 
-    # Shape 1 -- explicit "N=Label" pairs.
     pairs = re.findall(r"(\d+)\s*=\s*([A-Za-z][A-Za-z0-9 _-]*)", description)
     if len(pairs) >= 2:
         values = [int(v) for v, _ in pairs]
         labels = [label.strip() for _, label in pairs]
         return values, labels
 
-    # Shape 2 -- numeric range + slash-separated label list in parentheses.
     range_match = re.search(r"(\d+)\s*-\s*(\d+)", description)
     labels_match = re.search(r"\(([A-Za-z][A-Za-z0-9 _/-]*)\)", description)
     if range_match and labels_match:
@@ -152,43 +121,7 @@ def _parse_enum_from_description(description: str) -> tuple[list[int], list[str]
     return None
 
 
-def extract_schema_fields(spec: dict, schema_name: str) -> dict:
-    """Top-level scalar fields only (name -> {type, format, is_required
-    [, maxLength, minLength, pattern, minimum, maximum][, enum, enum_labels]
-    [, enum_source]})
-    — enough to know which generated row keys map directly onto the save
-    body, AND (critically, see Section 6.3) enough to tell the Data
-    Generator Agent the real target type of each field before generation
-    happens. Nested object/array fields (sub-DTOs) are listed separately
-    so the save step can knowingly skip them rather than silently drop
-    data.
-
-    Fixed-value byte/int fields (C# enums) are frequently exported by
-    Swashbuckle/NSwag as an "enum" list of numeric codes, with the
-    human-readable names alongside under one of a few vendor extension
-    keys. Capture both when present.
-
-    Some internal APIs (confirmed for DomainType on this APM instance via
-    server logs -- see _parse_enum_from_description docstring) don't emit
-    any of those at all, and only document the valid values inside a
-    free-text "description" string. When no formal enum info is found, we
-    fall back to best-effort parsing that description. `enum_source` on
-    the returned field_meta says which path supplied the enum info
-    ("schema" | "description" | absent if neither worked), purely for
-    debugging/logging -- never required by callers.
-
-    Two more things the same swagger schema already carries but which
-    used to be ignored:
-
-    - "required": [...] at the schema's top level -- which fields MUST be
-      filled in for APM to accept the save. Tagged per-field as
-      is_required so a missing mandatory field can be flagged before the
-      save is even attempted, instead of only discovered from a failed
-      response.
-    - Per-field maxLength/minLength/pattern/minimum/maximum -- value-shape
-      constraints APM actually enforces, so generated values can be
-      steered (and, as a safety net, checked) against them.
-    """
+async def extract_schema_fields(spec: dict, schema_name: str) -> dict:
     schemas = spec.get("components", {}).get("schemas", {})
     schema = schemas.get(schema_name, {})
     props = schema.get("properties", {})
@@ -224,9 +157,6 @@ def extract_schema_fields(spec: dict, schema_name: str) -> dict:
             )
             field_meta["enum_source"] = "schema"
         elif description:
-            # No formal enum on the property at all -- try to recover it
-            # from the description text before giving up (see docstring
-            # on _parse_enum_from_description for why this is needed).
             recovered = _parse_enum_from_description(description)
             if recovered:
                 enum_values, enum_labels = recovered
@@ -237,25 +167,27 @@ def extract_schema_fields(spec: dict, schema_name: str) -> dict:
         if enum_labels:
             field_meta["enum_labels"] = enum_labels
 
+        fk_ref = await resolve_fk_field(schema_name, name)
+        if fk_ref:
+            fk_options = await testdb_client.get_fk_options(
+                fk_ref["table"], fk_ref["id_column"], fk_ref["label_column"]
+            )
+            if fk_options:
+                field_meta["is_fk"] = True
+                field_meta["fk_options"] = fk_options
+            else:
+                logger.warning(
+                    "extract_schema_fields: declared FK resolved for (%r, %r) -> %s, "
+                    "but the live lookup returned no rows, falling back to plain-integer generation",
+                    schema_name, name, fk_ref["table"],
+                )
+
         scalar_fields[name] = field_meta
 
     return {"scalar_fields": scalar_fields, "nested_fields": nested_fields}
 
 
 def resolve_field_name(target: str, candidates: list[str]) -> tuple[str, float] | None:
-    """Fuzzy-match a single APM field name (target) against a list of
-    candidate frontend row keys, using the same normalize + SequenceMatcher
-    technique as resolve_module/resolve_save_endpoint above.
-
-    Used by row_mapper.map_row_to_schema as a fallback for fields that
-    don't have an exact-name match in the generated row (e.g. APM field
-    "CustomerName" vs frontend field "CustName") -- without this, such
-    fields were silently dropped from the save payload.
-
-    Returns (best_candidate, confidence) or None if nothing among the
-    candidates clears FIELD_MIN_CONFIDENCE, or if there are no candidates
-    left to match against.
-    """
     if not candidates:
         return None
 
