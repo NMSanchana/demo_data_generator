@@ -24,6 +24,7 @@ dist/
 build/
 *.egg
 
+
 # Environment files
 .env
 .env.*
