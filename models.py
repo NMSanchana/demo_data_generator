@@ -23,21 +23,79 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
-class GenerateRequest(BaseModel):
-    module:    str = Field(..., description="ERP module name, e.g. 'Skill Management'")
-    screen:    str | None = Field(
-        None,
-        description="Screen name, e.g. 'Skill Domain'. Omit to generate for every real screen under this module.",
+class ProfileMeta(BaseModel):
+    """
+    Provenance only -- the frontend has already resolved which features are
+    critical/optional/N-A for this profile (via its own applicability rules)
+    and which of them are selected for this run. The backend does not
+    re-derive applicability from this; it's carried through purely so runs
+    can be traced back to the profile/target/run configuration that
+    produced them (logging, history, debugging a bad run later).
+    """
+    id:              str
+    name:            str
+    catalog_version: str | None = None
+    target_id:       str | None = None
+    target_name:     str | None = None
+    mode:            str | None = Field(
+        None, description="'table' | 'api' | 'hybrid' as chosen in the frontend. "
+                           "'table' has no effect on the backend today -- there is "
+                           "no direct-DB-write path, only the APM save flow -- so "
+                           "'table' and 'api'/'hybrid' currently behave identically "
+                           "at generation time; the distinction only matters once a "
+                           "future save/push step is mode-aware."
     )
-    domain:    str = Field(..., min_length=1, description="Domain to flavor the generated vocabulary/content -- e.g. 'Agriculture & Farming', or anything typed")
-    subdomain: str | None = Field(None, description="Optional further specialisation, e.g. 'Organic Farming'")
-    geography: str = Field(..., min_length=1, description="Any location text -- a locality, city, state, or country. Resolved to a real place by the generation agent.")
-    row_count: int | None = Field(None, ge=1, le=100, description="Rows to generate per screen (default 20)")
+    seed:    str | None = None
+    top_up:  bool = Field(
+        False, description="'Top up an existing dataset instead of regenerating', "
+                            "as chosen in the frontend. Carried through for "
+                            "provenance/logging only -- the backend has no "
+                            "existing-key-reuse logic yet, so this currently has "
+                            "no effect on generation. Needs its own design when "
+                            "that capability is built."
+    )
+
+
+class ResolvedFeature(BaseModel):
+    """One feature the frontend has already decided to include in this run
+    (applicability resolved, any manual override applied)."""
+    id:             str = Field(..., description="Feature id from the frontend catalog")
+    name:           str = Field(..., description="Feature display name, e.g. 'Customer Master'")
+    data_templates: list[str] = Field(
+        ..., min_length=1,
+        description="The feature's dataTemplates -- a feature can span multiple "
+                     "screens/entities (e.g. 'approval_requests' + "
+                     "'approval_steps'). Each one is resolved to a real "
+                     "module+screen independently. See "
+                     "service/feature_resolver.py for how that resolution "
+                     "happens (KMS first, then a manual mapping, until KMS "
+                     "has real data)."
+    )
+    row_count: int | None = Field(None, ge=1, le=100, description="Overrides the request-level row_count for every screen under this feature")
+
+
+class GenerateRequest(BaseModel):
+    profile: ProfileMeta
+    domain:    str | None = Field(None, description="Resolved from the profile's Industry dimension selection, e.g. 'Manufacturing'")
+    subdomain: str | None = Field(None, description="Optional further specialisation, if the frontend's dimensions ever add one")
+    geography: str | None = Field(None, description="Resolved from the profile's Geography dimension selection, e.g. 'India'")
+    features:  list[ResolvedFeature] = Field(..., min_length=1)
+    row_count: int | None = Field(None, ge=1, le=100, description="Default rows per screen (default 20); a feature's own row_count overrides this")
 
 
 class ScreenResult(BaseModel):
     status:               str
     message:               str | None = None
+    feature_id:             str | None = None
+    feature_name:           str | None = None
+    data_template:          str | None = None
+    resolved_via:           str | None = Field(
+        None, description="How data_template was resolved to a module/screen: 'kms', 'manual_mapping', or None if unresolved"
+    )
+    fields_source:          str | None = Field(
+        None, description="Where this screen's fields came from: 'kms' (KMS record's own field list, used as primary "
+                           "when available) or 'architecture_agent' (parsed from the real component source)"
+    )
     screen:                str
     resolved_path:          str | None = None
     fields:                 list[dict] = []
@@ -51,31 +109,8 @@ class ScreenResult(BaseModel):
 
 
 class GenerateResponse(BaseModel):
-    module:  str
-    results: list[ScreenResult] = []
-
-
-class SettingsSaveRequest(BaseModel):
-    module:        str = Field(..., description="ERP module name, e.g. 'Skill Management'")
-    screen:        str | None = Field(
-        None,
-        description="Screen name, e.g. 'Skill Domain'. Omit/None to save the module-level default "
-                    "that applies to every screen under this module unless overridden.",
-    )
-    use_domain:    bool = Field(True, description="Whether the domain component is enabled")
-    use_subdomain: bool = Field(True, description="Whether the subdomain component is enabled")
-    use_geography: bool = Field(True, description="Whether the geography component is enabled")
-
-
-class SettingsResponse(BaseModel):
-    module:        str
-    screen:        str | None = None
-    use_domain:    bool
-    use_subdomain: bool
-    use_geography: bool
-    is_default:    bool = Field(
-        ..., description="True if this came from the all-enabled fallback (no row saved yet)"
-    )
+    profile_id: str
+    results:    list[ScreenResult] = []
 
 
 class SaveRowRequest(BaseModel):

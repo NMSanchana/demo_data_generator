@@ -112,3 +112,54 @@ def parse_component_html(html: str) -> list[dict]:
         )
 
     return fields
+
+
+# KMS records only give a plain list of field NAME strings -- no source
+# HTML tag to classify from. This guesses a kind purely from the name,
+# using the same identifier/name suffix heuristics as the real parser
+# above, extended to guess date/checkbox/textarea/picklist too. It's a
+# heuristic, not a fact -- unlike parse_component_html, which reads the
+# real component tag.
+_BOOLEAN_PREFIXES = ("is", "has")
+_BOOLEAN_SUFFIXES = ("flag", "enabled", "active")
+_DATE_MARKERS = ("date", "time")
+_TEXTAREA_MARKERS = ("description", "notes", "remarks", "comment", "comments")
+_PICKLIST_MARKERS = ("category", "type", "status", "reason", "uom", "currency", "priority")
+
+
+def _classify_by_name(field_name: str) -> str:
+    lower_name = field_name.lower()
+
+    if lower_name.endswith(_IDENTIFIER_SUFFIXES):
+        return "identifier"
+    if lower_name.endswith(_NAME_SUFFIXES):
+        return "name"
+    if lower_name.startswith(_BOOLEAN_PREFIXES) or lower_name.endswith(_BOOLEAN_SUFFIXES):
+        return "checkbox"
+    if any(m in lower_name for m in _DATE_MARKERS):
+        return "date"
+    if any(m in lower_name for m in _TEXTAREA_MARKERS):
+        return "textarea"
+    if any(m in lower_name for m in _PICKLIST_MARKERS):
+        return "picklist"
+    return "input"
+
+
+def classify_fields_from_names(field_names: list[str]) -> list[dict]:
+    """Builds schema_extraction-shaped field records from a plain list of
+    field name strings (what KMS provides), instead of parsing real HTML
+    (what parse_component_html does). Downstream code
+    (Agents/data_generator_agent.py) only actually reads field_name and
+    kind=='picklist' from these dicts -- selector/source_tag are filled in
+    for shape-compatibility/display only."""
+    fields: list[dict] = []
+    for name in field_names:
+        kind = _classify_by_name(name)
+        fields.append({
+            "field_name": name,
+            "kind": kind,
+            "selector": f"formControlName={name}",
+            "domain_sensitive": kind in _DOMAIN_SENSITIVE_KINDS,
+            "source_tag": "kms",
+        })
+    return fields

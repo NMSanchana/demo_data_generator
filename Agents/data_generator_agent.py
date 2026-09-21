@@ -94,13 +94,13 @@ def _build_user_message(state: dict) -> str:
         f"row_count: {row_count}",
     ]
 
-    if state.get("use_domain", True) and state.get("domain"):
+    if state.get("domain"):
         parts.append(f"domain: {state['domain']}")
 
-    if state.get("use_subdomain", True) and state.get("subdomain"):
+    if state.get("subdomain"):
         parts.append(f"subdomain: {state['subdomain']}")
 
-    if state.get("use_geography", True) and state.get("geography"):
+    if state.get("geography"):
         parts.append(f"geography: {state['geography']}")
         parts.append(
             "geography_already_resolved: "
@@ -169,9 +169,9 @@ async def data_generator_agent_node(state: dict) -> dict:
 
     logger.info(
         "data_generator_agent_node: generating for module=%r screen=%r "
-        "use_domain=%s use_subdomain=%s use_geography=%s apm_ready=%s",
+        "domain=%s subdomain=%s geography=%s apm_ready=%s",
         state.get("module"), state.get("screen"),
-        state.get("use_domain", True), state.get("use_subdomain", True), state.get("use_geography", True),
+        bool(state.get("domain")), bool(state.get("subdomain")), bool(state.get("geography")),
         bool(state.get("apm_type_hints")),
     )
 
@@ -187,7 +187,7 @@ async def data_generator_agent_node(state: dict) -> dict:
         return {"generated_rows": [], "resolved_geography": None, "generation_error": "Agent returned no rows."}
 
     resolved_geography = None
-    if state.get("use_geography", True) and state.get("geography"):
+    if state.get("geography"):
         resolved_geography = result.get("resolved_geography") or state["geography"]
 
     logger.info("data_generator_agent_node: generated %d row(s)", len(rows))

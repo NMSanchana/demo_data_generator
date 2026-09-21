@@ -20,10 +20,6 @@ class GeneratorState(TypedDict, total=False):
                                       # reuse it as-is instead of re-resolving)
     row_count: int | None
 
-    use_domain:    bool
-    use_subdomain: bool
-    use_geography: bool
-
     # Already-resolved by the pre-pass in main.py (architecture_agent +
     # schema_extraction step) -- this graph does not re-resolve or
     # re-extract.
