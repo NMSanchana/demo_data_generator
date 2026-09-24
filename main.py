@@ -15,6 +15,7 @@ from models import (
 from workflow.graph import generator_graph
 from service.apm_client import execute_save
 from service import feature_resolver
+from service.postgres_client import init_pool, close_pool
 from Agents import architecture_agent
 from Agents.apm_resolver_agent import resolve_apm_schema
 from Agents.data_generator_agent import build_entity_assignment_map
@@ -23,6 +24,8 @@ from tools.schema_parser import classify_fields_from_names
 from steps.apm_schema_resolution import resolve_for_generation
 from tools.row_mapper import map_row_to_schema
 from localedata.domain import DOMAIN_LIST
+from service.table_setup import run_migrations
+from routers import profiles, targets, workspaces, schedules, approvals, masking, dimensions
 
 load_dotenv()
 
@@ -50,6 +53,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Register store routers
+app.include_router(profiles.router)
+app.include_router(targets.router)
+app.include_router(workspaces.router)
+app.include_router(schedules.router)
+app.include_router(approvals.router)
+app.include_router(masking.router)
+app.include_router(dimensions.router)
+
+
+@app.on_event("startup")
+async def on_startup():
+    await init_pool()
+    await run_migrations()
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await close_pool()
 
 
 @app.get("/health")
