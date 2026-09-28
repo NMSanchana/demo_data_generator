@@ -1,4 +1,5 @@
 """CRUD for approval requests."""
+import json
 from service.postgres_client import get_pool
 
 

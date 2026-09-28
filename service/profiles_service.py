@@ -1,4 +1,5 @@
 """CRUD for profiles and applicability rules."""
+import json
 from service.postgres_client import get_pool
 
 

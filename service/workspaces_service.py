@@ -1,4 +1,5 @@
 """CRUD for workspaces."""
+import json
 from service.postgres_client import get_pool
 
 
