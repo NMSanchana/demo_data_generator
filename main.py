@@ -25,7 +25,7 @@ from steps.apm_schema_resolution import resolve_for_generation
 from tools.row_mapper import map_row_to_schema
 from localedata.domain import DOMAIN_LIST
 from service.table_setup import run_migrations
-from routers import profiles, targets, workspaces, schedules, approvals, masking, dimensions, dashboard
+from routers import profiles, targets, workspaces, schedules, approvals, masking, dimensions, dashboard, kms
 
 load_dotenv()
 
@@ -63,6 +63,7 @@ app.include_router(approvals.router)
 app.include_router(masking.router)
 app.include_router(dimensions.router)
 app.include_router(dashboard.router)
+app.include_router(kms.router)
 
 
 @app.on_event("startup")

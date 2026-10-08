@@ -5,6 +5,10 @@ file.
 
 Resolution order (a fallback chain, not an either/or switch):
 
+  0. KMS v2 exact match (pie_knowledge_v2) -- if the dataTemplate IS a known
+     screen_id (or alias), e.g. 'INVENTORY_ITEM_MASTER', resolve it exactly.
+     No fuzzy matching, no guessing. See service/kms_catalog.py.
+
   1. KMS (Qdrant, collection PIE_collection) -- real data, but from a single
      POC run of PIE, so coverage is partial. Confirmed reachable with no
      auth. Queried by pulling every point that has a module+screen
@@ -35,12 +39,15 @@ import time
 from qdrant_client import AsyncQdrantClient
 
 from localedata.feature_screen_map import FEATURE_SCREEN_MAP
+from service import kms_catalog
 
 logger = logging.getLogger(__name__)
 
 QDRANT_HOST = os.getenv("QDRANT_HOST", "217.217.249.121")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "PIE_collection")
+# The old fuzzy matcher below targets the ORIGINAL POC collection. QDRANT_COLLECTION now points
+# at pie_knowledge_v2 (read by service/kms_catalog.py), so the legacy path has its own variable.
+QDRANT_COLLECTION = os.getenv("KMS_LEGACY_COLLECTION", "PIE_collection")
 
 # Jaccard similarity threshold (intersection / union of query and candidate
 # tokens). Recalibrated from real test data: legitimate matches scored
@@ -184,6 +191,15 @@ async def resolve_feature_screen(data_template: str) -> dict:
       or
       {"ok": False, "error": str}
     """
+    try:
+        exact = await kms_catalog.lookup_screen(data_template)
+    except Exception as e:
+        logger.warning("feature_resolver: KMS v2 lookup failed (%s) -- continuing with legacy resolution.", e)
+        exact = None
+    if exact is not None:
+        logger.info("feature_resolver: KMS v2 exact match %r -> module=%r screen=%r", data_template, exact["module"], exact["screen_name"])
+        return {"ok": True, "resolved_via": "kms", "module": exact["module"], "screen": exact["screen_name"], "kms_fields": None}
+
     kms_result = await _resolve_from_kms(data_template)
     if kms_result is not None:
         return {"ok": True, "resolved_via": "kms", **kms_result}
