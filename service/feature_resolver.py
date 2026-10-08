@@ -1,223 +1,58 @@
 """
-Resolves a frontend feature's dataTemplate name to a real {module, screen}
-pair that Agents.architecture_agent can then resolve to an actual component
-file.
+Resolves a frontend feature's dataTemplate to a real {module, screen} pair.
 
-Resolution order (a fallback chain, not an either/or switch):
+Everything comes from the KMS collection (pie_knowledge_v2, see service/kms_catalog.py):
 
-  0. KMS v2 exact match (pie_knowledge_v2) -- if the dataTemplate IS a known
-     screen_id (or alias), e.g. 'INVENTORY_ITEM_MASTER', resolve it exactly.
-     No fuzzy matching, no guessing. See service/kms_catalog.py.
+  1. The dataTemplate is a KMS screen_id (or alias) -> exact match.
+     (The Features page sends each feature's screen_id as its dataTemplate.)
+  2. Otherwise it is matched by display name, but only if that name points at exactly
+     one screen.
+  3. Otherwise it is reported as unresolved -- never guessed.
 
-  1. KMS (Qdrant, collection PIE_collection) -- real data, but from a single
-     POC run of PIE, so coverage is partial. Confirmed reachable with no
-     auth. Queried by pulling every point that has a module+screen
-     (cached, refreshed every KMS_CACHE_SECONDS) and locally scoring each
-     one against the dataTemplate's words -- NOT vector/semantic search,
-     since PIE_collection's data is small (currently ~174 points) and this
-     avoids needing to replicate whatever embedding model PIE used just to
-     query it.
+The old fuzzy matcher over the previous collection (PIE_collection) and the hand-written
+localedata/feature_screen_map.py were removed: KMS is now the single source.
 
-  2. Manual mapping -- a hand-curated, backend-owned stand-in in
-     localedata/feature_screen_map.py, for anything KMS doesn't cover
-     (which, given partial POC coverage, will be most features for now).
-
-  3. Nothing -- if neither has an answer, the caller gets an explicit
-     "unresolved" result rather than a guess.
-
-This module deliberately does NOT do any fuzzy/LLM matching of the
-resolved module+screen against the real source repo -- that's
-architecture_agent's job, and only runs once a module+screen name is
-already known (from step 1 or 2 here).
+kms_fields: the field names KMS holds for the screen (FieldKnowledge points). When present,
+main.py uses them directly; when KMS has none, main.py falls back to parsing the real source.
 """
 
 import logging
-import os
-import re
-import time
 
-from qdrant_client import AsyncQdrantClient
-
-from localedata.feature_screen_map import FEATURE_SCREEN_MAP
 from service import kms_catalog
 
 logger = logging.getLogger(__name__)
-
-QDRANT_HOST = os.getenv("QDRANT_HOST", "217.217.249.121")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-# The old fuzzy matcher below targets the ORIGINAL POC collection. QDRANT_COLLECTION now points
-# at pie_knowledge_v2 (read by service/kms_catalog.py), so the legacy path has its own variable.
-QDRANT_COLLECTION = os.getenv("KMS_LEGACY_COLLECTION", "PIE_collection")
-
-# Jaccard similarity threshold (intersection / union of query and candidate
-# tokens). Recalibrated from real test data: legitimate matches scored
-# 0.25-0.38, an unrelated candidate scored 0.11 -- 0.2 was chosen to sit
-# between those, but this is still a starting point, not a measured
-# value; tune it once more real /generate runs show actual behavior.
-KMS_MATCH_THRESHOLD = 0.2
-KMS_CACHE_SECONDS = 300
-
-_qdrant_client: AsyncQdrantClient | None = None
-_kms_points_cache: list[dict] | None = None
-_kms_points_cache_at: float = 0.0
-
-
-def _get_client() -> AsyncQdrantClient:
-    global _qdrant_client
-    if _qdrant_client is None:
-        _qdrant_client = AsyncQdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-    return _qdrant_client
-
-
-def _tokenize(name: str) -> set[str]:
-    """'approval_requests' -> {'approval','requests'}; 'CustomerMaster' -> {'customer','master'}."""
-    s = re.sub(r"[_\-]+", " ", name)
-    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s)
-    return {t.lower() for t in s.split() if t}
-
-
-async def _load_kms_points(force_refresh: bool = False) -> list[dict]:
-    """Pulls every point from PIE_collection that has a module+screen
-    (skips pure documentation/how-to records that don't). Cached for
-    KMS_CACHE_SECONDS so a burst of /generate calls doesn't re-scroll the
-    whole collection each time."""
-    global _kms_points_cache, _kms_points_cache_at
-    now = time.time()
-    if not force_refresh and _kms_points_cache is not None and (now - _kms_points_cache_at) < KMS_CACHE_SECONDS:
-        return _kms_points_cache
-
-    client = _get_client()
-    points: list[dict] = []
-    try:
-        offset = None
-        while True:
-            batch, offset = await client.scroll(
-                collection_name=QDRANT_COLLECTION,
-                limit=200,
-                offset=offset,
-                with_payload=True,
-                with_vectors=False,
-            )
-            for p in batch:
-                payload = p.payload or {}
-                if payload.get("module") and payload.get("screen"):
-                    points.append(payload)
-            if offset is None:
-                break
-    except Exception as e:
-        logger.warning(
-            "feature_resolver: could not load KMS points from Qdrant at %s:%s (%s) -- "
-            "every feature will fall through to the manual mapping for this request.",
-            QDRANT_HOST, QDRANT_PORT, e,
-        )
-        return _kms_points_cache or []
-
-    _kms_points_cache = points
-    _kms_points_cache_at = now
-    logger.info("feature_resolver: loaded %d module/screen-tagged point(s) from KMS collection %r", len(points), QDRANT_COLLECTION)
-    return points
-
-
-def _score(query_tokens: set[str], payload: dict) -> float:
-    """Jaccard similarity: |shared words| / |all distinct words in either
-    side|. Plain query-coverage (shared/len(query)) was tried first but a
-    single-word query like 'tracking' scored a false 1.00 the instant that
-    one word appeared ANYWHERE in a candidate's text, regardless of how
-    unrelated the rest of it was. Jaccard penalizes that by also counting
-    the candidate's other, non-matching words against the score."""
-    haystack = " ".join([
-        str(payload.get("screen", "")),
-        str(payload.get("title", "")),
-        str(payload.get("module", "")),
-        " ".join(payload.get("tags", []) or []),
-    ])
-    haystack_tokens = _tokenize(haystack)
-    if not query_tokens or not haystack_tokens:
-        return 0.0
-    intersection = query_tokens & haystack_tokens
-    union = query_tokens | haystack_tokens
-    return len(intersection) / len(union)
-
-
-async def _resolve_from_kms(data_template: str) -> dict | None:
-    query_tokens = _tokenize(data_template)
-    if len(query_tokens) < 2:
-        # A single word is too ambiguous to trust from token overlap alone
-        # -- e.g. 'tracking' could mean asset tracking, serial tracking, or
-        # leave tracking, and nothing about matching that one word tells
-        # you which. Skip straight to the manual mapping for these.
-        logger.info("feature_resolver: skipping KMS match for single-word dataTemplate=%r (too ambiguous) -- falling through to manual mapping.", data_template)
-        return None
-
-    points = await _load_kms_points()
-    if not points:
-        return None
-
-    best_score, best_payload = 0.0, None
-    for payload in points:
-        s = _score(query_tokens, payload)
-        if s > best_score:
-            best_score, best_payload = s, payload
-
-    if best_payload is not None and best_score >= KMS_MATCH_THRESHOLD:
-        logger.info(
-            "feature_resolver: KMS matched dataTemplate=%r -> module=%r screen=%r (score=%.2f)",
-            data_template, best_payload["module"], best_payload["screen"], best_score,
-        )
-        return {
-            "module": best_payload["module"],
-            "screen": best_payload["screen"],
-            # PIE_collection records sometimes carry a plain field-name
-            # list (e.g. the "Reason Master Configuration" example) --
-            # carry it through so the caller can use it as the primary
-            # field source instead of parsing live source code.
-            "kms_fields": best_payload.get("fields") or None,
-        }
-
-    return None
-
-
-def _resolve_from_manual_mapping(data_template: str) -> dict | None:
-    entry = FEATURE_SCREEN_MAP.get(data_template)
-    if entry is None:
-        return None
-    return {"module": entry["module"], "screen": entry["screen"]}
 
 
 async def resolve_feature_screen(data_template: str) -> dict:
     """
     Returns:
-      {"ok": True, "module": str, "screen": str, "resolved_via": "kms" | "manual_mapping"}
+      {"ok": True, "resolved_via": "kms", "module": str, "screen": str, "kms_fields": list[str] | None}
       or
       {"ok": False, "error": str}
     """
     try:
-        exact = await kms_catalog.lookup_screen(data_template)
+        hit = await kms_catalog.lookup_screen(data_template)
     except Exception as e:
-        logger.warning("feature_resolver: KMS v2 lookup failed (%s) -- continuing with legacy resolution.", e)
-        exact = None
-    if exact is not None:
-        logger.info("feature_resolver: KMS v2 exact match %r -> module=%r screen=%r", data_template, exact["module"], exact["screen_name"])
-        return {"ok": True, "resolved_via": "kms", "module": exact["module"], "screen": exact["screen_name"], "kms_fields": None}
+        logger.warning("feature_resolver: KMS lookup failed for %r (%s)", data_template, e)
+        return {"ok": False, "error": f"KMS is unreachable, so '{data_template}' could not be resolved: {e}"}
 
-    kms_result = await _resolve_from_kms(data_template)
-    if kms_result is not None:
-        return {"ok": True, "resolved_via": "kms", **kms_result}
+    if hit is None:
+        logger.warning("feature_resolver: %r is not a screen in KMS", data_template)
+        return {
+            "ok": False,
+            "error": (
+                f"'{data_template}' is not a screen in the KMS collection. "
+                "Pick the feature from the KMS catalog (Features page) so its screen id is used."
+            ),
+        }
 
-    manual_result = _resolve_from_manual_mapping(data_template)
-    if manual_result is not None:
-        return {"ok": True, "resolved_via": "manual_mapping", **manual_result}
+    kms_fields: list[str] | None = None
+    try:
+        names = await kms_catalog.get_screen_field_names(hit["screen_id"])
+        kms_fields = names or None
+    except Exception as e:
+        logger.warning("feature_resolver: could not read KMS fields for %r (%s) -- falling back to source parsing", hit["screen_id"], e)
 
-    logger.warning(
-        "feature_resolver: no KMS or manual mapping for dataTemplate=%r -- "
-        "add it to localedata/feature_screen_map.py, or wait for KMS coverage.",
-        data_template,
-    )
-    return {
-        "ok": False,
-        "error": (
-            f"No module/screen mapping found for feature '{data_template}'. "
-            "KMS doesn't have data yet and there's no manual mapping entry "
-            "for it either -- add one to localedata/feature_screen_map.py."
-        ),
-    }
+    logger.info("feature_resolver: %r -> module=%r screen=%r (%d KMS fields)",
+                data_template, hit["module"], hit["screen_name"], len(kms_fields or []))
+    return {"ok": True, "resolved_via": "kms", "module": hit["module"], "screen": hit["screen_name"], "kms_fields": kms_fields}

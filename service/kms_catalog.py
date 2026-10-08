@@ -58,8 +58,9 @@ DEFAULT_MAX_PER_PARENT = 5
 def _cfg() -> tuple[str, str, dict]:
     url = os.getenv("QDRANT_URL")
     if not url:
-        host = os.getenv("QDRANT_HOST", "217.217.249.121")
-        port = os.getenv("QDRANT_PORT", "6333")
+        host, port = os.getenv("QDRANT_HOST"), os.getenv("QDRANT_PORT", "6333")
+        if not host:
+            raise RuntimeError("QDRANT_URL must be set in .env (see .env.example).")
         url = f"http://{host}:{port}"
     collection = os.getenv("QDRANT_COLLECTION", "pie_knowledge_v2")
     headers = {"Content-Type": "application/json"}
@@ -143,6 +144,10 @@ def _norm_table(name: Any) -> str:
     return n
 
 
+def _norm_name(text: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
 def _title(code: str) -> str:
     return (code or "Unassigned").replace("_", " ").title()
 
@@ -173,13 +178,33 @@ def _owner_score(table: str, screen_id: str, module: str) -> int:
 # Relationships
 # ----------------------------------------------------------------------
 
+def _resolve_hint(name: str, known: set[str]) -> str | None:
+    """A 'related master' hint is a loose name (e.g. ACCOUNT). Accept it only if it
+    matches a real table KMS knows about: exact, or with the usual 'M' master prefix."""
+    n = _norm_table(name)
+    if not n:
+        return None
+    for cand in (n, "M" + n):
+        if cand in known:
+            return cand
+    return None
+
+
 def build_relationships(field_points: list[dict], features_by_screen: dict[str, dict]) -> dict:
-    """Derive entities + relationships from FieldKnowledge payloads."""
-    # 1) Which screens declare a table's primary key? -> owner screen for the entity.
+    """Derive entities + relationships from FieldKnowledge payloads.
+
+    One relationship per (parent table, child table) pair. Several columns that point at the
+    same parent are merged into that single relationship (`childColumns`).
+
+    status:
+      confirmed -> backed by a declared database foreign key (required = child column is NOT NULL)
+      suggested -> only a 'related master' hint or a grid/child-table hint. Never marked required.
+                   Hints that do not match a real table are dropped (counted in unresolvedHints).
+    """
     pk_screens: dict[str, set[tuple[str, str]]] = {}
-    all_tables: set[str] = set()
-    # candidate relationships keyed by (parent_table, child_table, column)
-    cands: dict[tuple[str, str, str], dict] = {}
+    real_tables: set[str] = set()
+    fk_rows: list[dict] = []
+    hint_rows: list[dict] = []
     child_table_pairs: dict[tuple[str, str], dict] = {}
 
     for p in field_points:
@@ -189,75 +214,100 @@ def build_relationships(field_points: list[dict], features_by_screen: dict[str, 
         db = field.get("database") or {}
         mand = field.get("mandatory") or {}
         table = _norm_table(db.get("table"))
-        point_conf = p.get("confidence")
-        point_conf = float(point_conf) if isinstance(point_conf, (int, float)) else 1.0
-
-        if table:
-            all_tables.add(table)
-            if db.get("primaryKey") is True and screen_id:
-                pk_screens.setdefault(table, set()).add((screen_id, module))
-
         if not table:
             continue
+        real_tables.add(table)
+        if db.get("primaryKey") is True and screen_id:
+            pk_screens.setdefault(table, set()).add((screen_id, module))
 
+        point_conf = p.get("confidence")
+        point_conf = float(point_conf) if isinstance(point_conf, (int, float)) else 1.0
+        col = str(db.get("column") or p.get("field_name") or "")
         required = bool(db.get("nullable") is False or mand.get("required"))
         evidence = [
             {"source": e.get("source"), "line": e.get("line"), "fact": e.get("fact")}
             for e in (field.get("evidence") or [])[:2] if isinstance(e, dict)
         ]
-
-        def add(parent: str, parent_col: str, source: str, conf: float, one_to_one: bool):
-            parent = _norm_table(parent)
-            if not parent:
-                return
-            all_tables.add(parent)
-            key = (parent, table, str(db.get("column") or p.get("field_name") or ""))
-            c = cands.get(key)
-            if c is None:
-                c = cands[key] = {
-                    "parent": parent, "child": table,
-                    "childColumn": db.get("column") or p.get("field_name") or "",
-                    "parentColumn": parent_col or "",
-                    "source": source, "confidence": conf,
-                    "required": required, "oneToOne": one_to_one,
-                    "screens": set(), "modules": set(), "evidence": [],
-                }
-            else:
-                # an actual DB foreign key always beats a "related master" hint
-                if source == "kms_foreign_key" and c["source"] != "kms_foreign_key":
-                    c.update(source=source, confidence=conf, parentColumn=parent_col or c["parentColumn"])
-                c["required"] = c["required"] or required
-                c["oneToOne"] = c["oneToOne"] or one_to_one
-            if screen_id:
-                c["screens"].add(screen_id)
-            if module:
-                c["modules"].add(module)
-            for ev in evidence:
-                if ev not in c["evidence"] and len(c["evidence"]) < 3:
-                    c["evidence"].append(ev)
+        base = {"child": table, "childColumn": col, "required": required, "screen": screen_id,
+                "module": module, "evidence": evidence}
 
         fk = db.get("foreignKey")
         if isinstance(fk, dict) and fk.get("table"):
-            add(fk["table"], str(fk.get("column") or ""), "kms_foreign_key", min(1.0, point_conf), db.get("primaryKey") is True)
+            parent = _norm_table(fk["table"])
+            if parent:
+                real_tables.add(parent)
+                fk_rows.append({**base, "parent": parent, "parentColumn": str(fk.get("column") or ""),
+                                "confidence": min(1.0, point_conf), "oneToOne": db.get("primaryKey") is True})
         else:
             for rm in field.get("relatedMasters") or []:
-                add(rm, "", "kms_related_master", 0.6, False)
+                hint_rows.append({**base, "hint": rm})
 
-        # grid / child-table hint: only trusted if it is a plain table name
         ct = db.get("childTable")
         if isinstance(ct, dict):
             ct = ct.get("table") or ct.get("name")
         ct = _norm_table(ct) if isinstance(ct, str) else ""
         if ct and ct != table:
-            all_tables.add(ct)
-            k2 = (table, ct)
-            d = child_table_pairs.setdefault(k2, {"screens": set(), "modules": set()})
+            d = child_table_pairs.setdefault((table, ct), {"screens": set(), "modules": set()})
             if screen_id:
                 d["screens"].add(screen_id)
             if module:
                 d["modules"].add(module)
 
-    # 2) Pick one owner screen per table.
+    # ---- merge into one record per (parent, child) pair ----
+    pairs: dict[tuple[str, str], dict] = {}
+    self_refs = 0
+
+    def pair_for(parent: str, child: str, source: str, conf: float) -> dict:
+        return pairs.setdefault((parent, child), {
+            "parent": parent, "child": child, "source": source, "confidence": conf,
+            "required": False, "oneToOne": False, "columns": {},
+            "screens": set(), "modules": set(), "evidence": [],
+        })
+
+    def absorb(rec: dict, row: dict):
+        if row["screen"]:
+            rec["screens"].add(row["screen"])
+        if row["module"]:
+            rec["modules"].add(row["module"])
+        for ev in row["evidence"]:
+            if ev not in rec["evidence"] and len(rec["evidence"]) < 3:
+                rec["evidence"].append(ev)
+
+    for r in fk_rows:
+        if r["parent"] == r["child"]:
+            self_refs += 1
+            continue
+        rec = pair_for(r["parent"], r["child"], "kms_foreign_key", r["confidence"])
+        rec["source"] = "kms_foreign_key"
+        rec["confidence"] = max(rec["confidence"], r["confidence"])
+        rec["required"] = rec["required"] or r["required"]
+        rec["oneToOne"] = rec["oneToOne"] or r["oneToOne"]
+        rec["columns"][r["childColumn"]] = r["parentColumn"]
+        absorb(rec, r)
+
+    unresolved: set[str] = set()
+    for r in hint_rows:
+        parent = _resolve_hint(r["hint"], real_tables)
+        if not parent:
+            unresolved.add(_norm_table(r["hint"]))
+            continue
+        if parent == r["child"]:
+            continue
+        rec = pairs.get((parent, r["child"]))
+        if rec is None:
+            rec = pair_for(parent, r["child"], "kms_related_master", 0.6)
+        if rec["source"] == "kms_related_master":
+            rec["columns"].setdefault(r["childColumn"], "")
+        absorb(rec, r)
+
+    for (parent, child), d in child_table_pairs.items():
+        if parent == child or (parent, child) in pairs or parent not in real_tables and child not in real_tables:
+            continue
+        rec = pair_for(parent, child, "kms_child_table", 0.5)
+        rec["screens"] |= d["screens"]
+        rec["modules"] |= d["modules"]
+
+    # ---- owner screen per table ----
     def owner_of(table: str) -> tuple[str | None, str]:
         options = sorted(pk_screens.get(table, set()))
         if not options:
@@ -265,7 +315,11 @@ def build_relationships(field_points: list[dict], features_by_screen: dict[str, 
         options.sort(key=lambda o: (-_owner_score(table, o[0], o[1]), len(o[0]), o[0]))
         return options[0]
 
-    # 3) Entities
+    all_tables = set(real_tables)
+    for (parent, child) in pairs:
+        all_tables.add(parent)
+        all_tables.add(child)
+
     entities: dict[str, dict] = {}
     for t in sorted(all_tables):
         sid, mod = owner_of(t)
@@ -280,62 +334,50 @@ def build_relationships(field_points: list[dict], features_by_screen: dict[str, 
             "estimatedRowsBasis": "default_by_category" if feat else "default",
         }
 
-    # 4) Relationships
+    # ---- relationships ----
     relationships: list[dict] = []
-    seen_pairs: set[tuple[str, str]] = set()
-    self_refs = 0
-    for (parent, child, _col), c in sorted(cands.items()):
-        if parent == child:
-            self_refs += 1
-            continue
-        seen_pairs.add((parent, child))
-        one = c["oneToOne"]
-        required = c["required"]
+    for (parent, child), c in sorted(pairs.items()):
+        confirmed = c["source"] == "kms_foreign_key"
+        required = bool(confirmed and c["required"])
+        one = bool(confirmed and c["oneToOne"])
+        cols = sorted(k for k in c["columns"] if k)
+        if confirmed and cols:
+            shown = ", ".join(f"{k}\u2192{c['columns'][k]}" if c["columns"][k] else k for k in cols[:3])
+            if len(cols) > 3:
+                shown += f" +{len(cols) - 3} more"
+            note = f"{child}.{shown} (parent: {parent})"
+        elif c["source"] == "kms_related_master":
+            note = f"{child} refers to master {parent} (hint from KMS, not a declared foreign key)"
+        else:
+            note = f"{child} is a detail/grid table of {parent}"
         relationships.append({
-            "id": f"rel-{child.lower()}-{_slug(c['childColumn'])}-{parent.lower()}",
+            "id": f"rel-{child.lower()}-{parent.lower()}",
             "fromEntityId": entities[parent]["id"],
             "toEntityId": entities[child]["id"],
             "kind": "one-to-one" if one else "one-to-many",
-            "minPerParent": (1 if one else (DEFAULT_MIN_PER_PARENT_REQUIRED if required else DEFAULT_MIN_PER_PARENT_OPTIONAL)),
+            "minPerParent": 1 if one else (DEFAULT_MIN_PER_PARENT_REQUIRED if required else DEFAULT_MIN_PER_PARENT_OPTIONAL),
             "maxPerParent": 1 if one else DEFAULT_MAX_PER_PARENT,
             "required": required,
-            "note": f"{child}.{c['childColumn']} \u2192 {parent}" + (f".{c['parentColumn']}" if c["parentColumn"] else ""),
+            "note": note,
             "source": c["source"],
+            "status": "confirmed" if confirmed else "suggested",
             "confidence": c["confidence"],
+            "childColumns": cols,
             "defaultsApplied": True,
             "screens": sorted(c["screens"])[:12],
             "modules": sorted(c["modules"]),
             "evidence": c["evidence"],
         })
 
-    for (parent, child), d in sorted(child_table_pairs.items()):
-        if (parent, child) in seen_pairs or parent == child:
-            continue
-        relationships.append({
-            "id": f"rel-{child.lower()}-grid-{parent.lower()}",
-            "fromEntityId": entities[parent]["id"],
-            "toEntityId": entities[child]["id"],
-            "kind": "one-to-many",
-            "minPerParent": 0,
-            "maxPerParent": DEFAULT_MAX_PER_PARENT,
-            "required": False,
-            "note": f"{child} is a detail/grid table of {parent}",
-            "source": "kms_child_table",
-            "confidence": 0.5,
-            "defaultsApplied": True,
-            "screens": sorted(d["screens"])[:12],
-            "modules": sorted(d["modules"]),
-            "evidence": [],
-        })
-
-    # Only keep entities that take part in a relationship OR own a screen.
     linked = {r["fromEntityId"] for r in relationships} | {r["toEntityId"] for r in relationships}
     entity_list = [e for e in entities.values() if e["id"] in linked or e["featureId"]]
 
-    # screen -> screens it depends on (parent table's owner screen)
+    # screen -> screens it depends on. Only confirmed links count as real dependencies.
     deps: dict[str, set[str]] = {}
     ent_by_id = {e["id"]: e for e in entities.values()}
     for r in relationships:
+        if r["status"] != "confirmed":
+            continue
         parent_owner = ent_by_id[r["fromEntityId"]]["featureId"]
         if not parent_owner:
             continue
@@ -351,7 +393,10 @@ def build_relationships(field_points: list[dict], features_by_screen: dict[str, 
             "tables": len(all_tables),
             "entities": len(entity_list),
             "relationships": len(relationships),
+            "confirmed": sum(1 for r in relationships if r["status"] == "confirmed"),
+            "suggested": sum(1 for r in relationships if r["status"] == "suggested"),
             "selfReferencesSkipped": self_refs,
+            "unresolvedHints": len(unresolved),
             "fieldPointsRead": len(field_points),
         },
     }
@@ -490,11 +535,18 @@ async def _build_snapshot() -> dict:
 
     # fast lookup for the /generate resolver
     screens: dict[str, dict] = {}
+    by_name: dict[str, list[dict]] = {}
     for f in catalog["features"]:
         entry = {"screen_id": f["id"], "module": f["moduleId"], "screen_name": f["screenName"] or f["name"]}
         screens[f["id"].upper()] = entry
         for alias in f["aliasScreenIds"]:
             screens.setdefault(str(alias).upper(), entry)
+        for label in {f["screenName"], f["name"]}:
+            k = _norm_name(label)
+            if k and entry not in by_name.setdefault(k, []):
+                by_name[k].append(entry)
+    # a display name is only usable when it points at exactly one screen
+    screens_by_name = {k: v[0] for k, v in by_name.items() if len(v) == 1}
 
     now = time.time()
     meta = {
@@ -505,7 +557,7 @@ async def _build_snapshot() -> dict:
         "warnings": warnings,
         "notes": [
             "Features come from deterministic UsageFeature/UsageModule/UsageCapability points.",
-            "Relationships are derived from database foreign keys and related masters in FieldKnowledge. KMS marks inferred links as unconfirmed.",
+            "Relationships: one per table pair. confirmed = declared database foreign key; suggested = related-master / grid hint (never required).",
             "KMS has no min/max children per parent or row counts: those numbers are defaults (defaultsApplied=true).",
         ],
     }
@@ -517,6 +569,7 @@ async def _build_snapshot() -> dict:
             "meta": {**meta, **rels["stats"]},
         },
         "screens": screens,
+        "screensByName": screens_by_name,
     }
 
 
@@ -562,12 +615,41 @@ def filter_relationships(snapshot_rels: dict, module: str | None, min_confidence
 
 
 async def lookup_screen(data_template: str) -> dict | None:
-    """Exact screen_id (or alias) match -> {screen_id, module, screen_name}. Used by feature_resolver."""
-    key = re.sub(r"\s+", "_", (data_template or "").strip()).upper()
-    if not key:
+    """Screen id (or alias) -> {screen_id, module, screen_name}. Falls back to an
+    unambiguous display-name match. No guessing beyond that."""
+    raw = (data_template or "").strip()
+    if not raw:
         return None
     snap = await get_snapshot()
-    return snap["screens"].get(key)
+    hit = snap["screens"].get(re.sub(r"\s+", "_", raw).upper())
+    if hit:
+        return hit
+    return snap["screensByName"].get(_norm_name(raw))
+
+
+_fields_cache: dict[str, tuple[float, list[str]]] = {}
+
+
+async def get_screen_field_names(screen_id: str) -> list[str]:
+    """Field names KMS knows for one screen (FieldKnowledge points), in stored order.
+    Empty list when KMS has none -- the caller then falls back to parsing the source."""
+    key = screen_id.upper()
+    cached = _fields_cache.get(key)
+    if cached and (time.time() - cached[0]) < _cache_seconds():
+        return cached[1]
+    flt = {"must": [
+        {"key": "knowledge_type", "match": {"value": "FieldKnowledge"}},
+        {"key": "screen_id", "match": {"value": screen_id}},
+    ]}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        pts = await _scroll(client, flt, ["screen_id", "field_name"])
+    names: list[str] = []
+    for p in pts:
+        n = str(p.get("field_name") or "").strip()
+        if n and n not in names:
+            names.append(n)
+    _fields_cache[key] = (time.time(), names)
+    return names
 
 
 async def health() -> dict:
