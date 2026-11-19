@@ -20,7 +20,7 @@ from Agents import architecture_agent
 from Agents.apm_resolver_agent import resolve_apm_schema
 from Agents.data_generator_agent import build_entity_assignment_map
 from steps import schema_extraction
-from tools.schema_parser import classify_fields_from_names
+from tools.schema_parser import classify_fields
 from steps.apm_schema_resolution import resolve_for_generation
 from tools.row_mapper import map_row_to_schema
 from localedata.domain import DOMAIN_LIST
@@ -125,17 +125,18 @@ async def _resolve_feature_screens(features: list) -> list[dict]:
                 })
                 continue
 
-            module, screen = mapping["module"], mapping["screen"]
+            module, apm_module, screen = mapping["module"], mapping["apm_module"], mapping["screen"]
+            screen_id = mapping.get("screen_id")
             kms_fields = mapping.get("kms_fields")
 
             if kms_fields:
                 out.append({
                     "ok": True, "feature": feat, "data_template": data_template,
-                    "module": module, "screen_name": screen,
+                    "module": module, "apm_module": apm_module, "screen_id": screen_id, "screen_name": screen,
                     "resolved_via": mapping["resolved_via"],
                     "fields_source": "kms",
                     "path": None,
-                    "fields": classify_fields_from_names(kms_fields),
+                    "fields": classify_fields(kms_fields),
                 })
                 continue
 
@@ -144,7 +145,7 @@ async def _resolve_feature_screens(features: list) -> list[dict]:
                 out.append({"ok": False, "feature": feat, "data_template": data_template, "screen_name": screen, "error": resolved.get("error", "Resolution failed")})
                 continue
 
-            out.append({**resolved, "ok": True, "feature": feat, "data_template": data_template, "module": module, "resolved_via": mapping["resolved_via"], "fields_source": "architecture_agent"})
+            out.append({**resolved, "ok": True, "feature": feat, "data_template": data_template, "module": module, "apm_module": apm_module, "screen_id": screen_id, "resolved_via": mapping["resolved_via"], "fields_source": "architecture_agent"})
     return out
 
 
@@ -179,13 +180,19 @@ async def generate(request: GenerateRequest):
             screen_contexts.append({"ok": False, "feature": feat, "data_template": r["data_template"], "screen_name": r["screen_name"], "error": "No form fields found on this screen."})
             continue
 
-        apm_resolution = await resolve_for_generation(r["module"], r["screen_name"])
+        # APM gets the APM-side module name and, as alternates for matching the Save endpoint,
+        # the KMS screen id's tail (e.g. "ACCOUNTS_MACCOUNT" -> "MACCOUNT") besides the display name.
+        sid = r.get("screen_id") or ""
+        aliases = [sid.split("_", 1)[1]] if "_" in sid else ([sid] if sid else [])
+        apm_resolution = await resolve_for_generation(r["apm_module"], r["screen_name"], aliases)
 
         screen_contexts.append({
             "ok": True,
             "feature": feat,
             "data_template": r["data_template"],
             "module": r["module"],
+            "apm_module": r["apm_module"],
+            "screen_id": r.get("screen_id"),
             "screen_name": r["screen_name"],
             "resolved_path": r.get("path"),
             "resolved_via": r["resolved_via"],
@@ -281,6 +288,9 @@ async def generate(request: GenerateRequest):
             resolved_via=ctx["resolved_via"],
             fields_source=ctx["fields_source"],
             screen=ctx["screen_name"],
+            module=ctx["apm_module"],
+            kms_module=ctx["module"],
+            screen_id=ctx.get("screen_id"),
             resolved_path=ctx["resolved_path"],
             fields=ctx["fields"],
             rows=rows,

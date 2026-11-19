@@ -97,6 +97,11 @@ class ScreenResult(BaseModel):
                            "when available) or 'architecture_agent' (parsed from the real component source)"
     )
     screen:                str
+    module:                 str | None = Field(
+        None, description="Module name to send back to /save-row (the APM-side module this screen resolved to)"
+    )
+    kms_module:             str | None = Field(None, description="The KMS module code this screen belongs to")
+    screen_id:              str | None = Field(None, description="KMS screen id")
     resolved_path:          str | None = None
     fields:                 list[dict] = []
     rows:                   list[dict] = []

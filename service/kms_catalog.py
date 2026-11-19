@@ -32,6 +32,8 @@ from typing import Any
 
 import httpx
 
+from service import module_names
+
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 1000
@@ -154,6 +156,11 @@ def _title(code: str) -> str:
 
 def _rows_for(category: str | None) -> int:
     return ROWS_BY_CATEGORY.get((category or "").strip().lower(), DEFAULT_ROWS)
+
+
+def _is_generatable(category: str | None) -> bool:
+    """Report screens (KMS category 'Report', 0 estimated rows) hold no data to generate."""
+    return _rows_for(category) > 0
 
 
 def _owner_score(table: str, screen_id: str, module: str) -> int:
@@ -429,9 +436,13 @@ def build_catalog(module_pts: list[dict], cap_pts: list[dict], feat_pts: list[di
 
         prod = products.setdefault(pid, {"id": pid, "name": product_name, "description": "Knowledge-managed product catalog (PIE / KMS)", "modules": {}})
         minfo = module_info.get(mod_code, {})
+        mod_name, covers = module_names.display_name(mod_code, minfo.get("functionality"))
+        mod_desc = minfo.get("content") or ""
+        if covers:
+            mod_desc = (f"Covers: {', '.join(covers)}. " + mod_desc).strip()
         mod = prod["modules"].setdefault(mod_id, {
-            "id": mod_id, "name": minfo.get("functionality") or _title(mod_code),
-            "description": minfo.get("content") or "", "productId": pid, "functionalities": {},
+            "id": mod_id, "name": mod_name, "covers": covers,
+            "description": mod_desc, "productId": pid, "functionalities": {},
         })
         cinfo = cap_info.get((mod_code, cap_name), {})
         mod["functionalities"].setdefault(fn_id, {
@@ -453,6 +464,8 @@ def build_catalog(module_pts: list[dict], cap_pts: list[dict], feat_pts: list[di
             "isCommon": category.strip().lower() == "master data",
             "estimatedRows": _rows_for(category),
             "estimatedRowsBasis": "default_by_category",
+            "generatable": _is_generatable(category),
+            "moduleName": mod["name"],
             "dependencies": [],
             "dataTemplates": [screen_id],
             "screenId": screen_id,
@@ -537,7 +550,10 @@ async def _build_snapshot() -> dict:
     screens: dict[str, dict] = {}
     by_name: dict[str, list[dict]] = {}
     for f in catalog["features"]:
-        entry = {"screen_id": f["id"], "module": f["moduleId"], "screen_name": f["screenName"] or f["name"]}
+        entry = {
+            "screen_id": f["id"], "module": f["moduleId"], "screen_name": f["screenName"] or f["name"],
+            "category": f["category"], "generatable": f["generatable"],
+        }
         screens[f["id"].upper()] = entry
         for alias in f["aliasScreenIds"]:
             screens.setdefault(str(alias).upper(), entry)
@@ -627,12 +643,92 @@ async def lookup_screen(data_template: str) -> dict | None:
     return snap["screensByName"].get(_norm_name(raw))
 
 
-_fields_cache: dict[str, tuple[float, list[str]]] = {}
+# ----------------------------------------------------------------------
+# Field names for one screen (what /generate uses as the form's fields)
+# ----------------------------------------------------------------------
+#
+# FieldKnowledge holds EVERY field PIE found for a screen: header fields, grid/child-table
+# columns, joined display columns and audit columns. A demo row should look like the screen's
+# header form (what the APM Save endpoint takes), so we keep:
+#   * fields of the screen's main table (the table whose primary key the screen owns), and
+#   * fields with no database table at all (UI-only inputs),
+# and drop audit/system columns and fields that belong to other (grid / joined) tables.
+# Every drop is listed with its reason in GET /kms/screens/{id}/fields?detail=true so the
+# filtering can be checked against real KMS data. If filtering would leave < 2 fields, nothing
+# is filtered (poor-but-complete beats empty).
+
+_SYSTEM_SUBSTRINGS = (
+    "createdby", "modifiedby", "updatedby", "deletedby", "createdon", "modifiedon", "updatedon",
+    "deletedon", "createddate", "modifieddate", "updateddate", "createdat", "updatedat",
+    "rowversion", "lastmodified", "lastupdated",
+)
+_SYSTEM_EXACT = {"timestamp", "isdeleted", "deleted", "tenantid", "auditid", "guid", "rowguid"}
 
 
-async def get_screen_field_names(screen_id: str) -> list[str]:
-    """Field names KMS knows for one screen (FieldKnowledge points), in stored order.
-    Empty list when KMS has none -- the caller then falls back to parsing the source."""
+def _is_system_field(name: str) -> bool:
+    n = _norm_name(name)
+    return n in _SYSTEM_EXACT or any(s in n for s in _SYSTEM_SUBSTRINGS)
+
+
+def _field_info(p: dict) -> dict:
+    field = p.get("field") or {}
+    db = field.get("database") or {}
+    mand = field.get("mandatory") or {}
+    dtype = field.get("dataType") or field.get("type") or db.get("dataType") or db.get("type") or ""
+    return {
+        "name": str(p.get("field_name") or "").strip(),
+        "table": _norm_table(db.get("table")),
+        "column": str(db.get("column") or ""),
+        "primaryKey": db.get("primaryKey") is True,
+        "required": bool(mand.get("required") or db.get("nullable") is False),
+        "dataType": str(dtype).lower() if isinstance(dtype, (str, int, float)) else "",
+    }
+
+
+def select_screen_fields(points: list[dict]) -> dict:
+    infos, seen = [], set()
+    for p in points:
+        i = _field_info(p)
+        if i["name"] and i["name"] not in seen:
+            seen.add(i["name"])
+            infos.append(i)
+
+    dropped: list[dict] = []
+    candidates = []
+    for i in infos:
+        if _is_system_field(i["name"]):
+            dropped.append({"name": i["name"], "reason": "audit/system column"})
+        else:
+            candidates.append(i)
+
+    counts: dict[str, int] = {}
+    for i in candidates:
+        if i["primaryKey"] and i["table"]:
+            counts[i["table"]] = counts.get(i["table"], 0) + 1
+    main_table = max(counts, key=counts.get) if counts else None
+
+    kept = candidates
+    if main_table:
+        on_main = [i for i in candidates if not i["table"] or i["table"] == main_table]
+        if len(on_main) >= 2:
+            kept = on_main
+            dropped += [{"name": i["name"], "reason": f"belongs to {i['table']} (grid / joined table), not {main_table}"}
+                        for i in candidates if i not in on_main]
+    if len(kept) < 2 and len(candidates) >= 2:
+        kept = candidates
+
+    # mandatory fields first, then primary keys, then the rest, each in stored order
+    order = {id(i): n for n, i in enumerate(kept)}
+    kept = sorted(kept, key=lambda i: (not i["required"], not i["primaryKey"], order[id(i)]))
+    return {"fields": kept, "dropped": dropped, "mainTable": main_table, "totalInKms": len(infos)}
+
+
+_fields_cache: dict[str, tuple[float, dict]] = {}
+
+
+async def get_screen_fields(screen_id: str) -> dict:
+    """{fields: [{name, required, table, column, dataType, primaryKey}], dropped, mainTable, totalInKms}.
+    `fields` is empty when KMS has none -- the caller then falls back to parsing the source."""
     key = screen_id.upper()
     cached = _fields_cache.get(key)
     if cached and (time.time() - cached[0]) < _cache_seconds():
@@ -642,14 +738,31 @@ async def get_screen_field_names(screen_id: str) -> list[str]:
         {"key": "screen_id", "match": {"value": screen_id}},
     ]}
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-        pts = await _scroll(client, flt, ["screen_id", "field_name"])
-    names: list[str] = []
-    for p in pts:
-        n = str(p.get("field_name") or "").strip()
-        if n and n not in names:
-            names.append(n)
-    _fields_cache[key] = (time.time(), names)
-    return names
+        pts = await _scroll(client, flt, ["screen_id", "field_name", "field"])
+    result = select_screen_fields(pts)
+    _fields_cache[key] = (time.time(), result)
+    return result
+
+
+async def get_screen_field_names(screen_id: str) -> list[str]:
+    """Names only (kept for callers that just need the list)."""
+    return [f["name"] for f in (await get_screen_fields(screen_id))["fields"]]
+
+
+async def module_report() -> list[dict]:
+    """Every KMS module code with the APM module it resolves to -- for checking module matching."""
+    snap = await get_snapshot()
+    codes: dict[str, dict] = {}
+    for f in snap["catalog"]["features"]:
+        c = codes.setdefault(f["moduleId"], {"code": f["moduleId"], "displayName": f["moduleName"], "features": 0})
+        c["features"] += 1
+    out = []
+    for c in sorted(codes.values(), key=lambda x: x["code"]):
+        m = module_names.apm_match(c["code"])
+        out.append({**c,
+                    "apmModule": m["entry"]["module"] if m["entry"] else None,
+                    "matchedBy": m["matchedBy"], "similarity": m["similarity"]})
+    return out
 
 
 async def health() -> dict:

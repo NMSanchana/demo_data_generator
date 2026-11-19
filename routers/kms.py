@@ -28,15 +28,31 @@ async def kms_relationships(module: str | None = None, min_confidence: float = 0
     return kms_catalog.filter_relationships(snap["relationships"], module, min_confidence)
 
 
-@router.get("/screens/{screen_id}/fields", summary="Field names KMS holds for one screen (what /generate will use)")
-async def kms_screen_fields(screen_id: str):
+@router.get("/screens/{screen_id}/fields", summary="Fields KMS holds for one screen (what /generate will use)")
+async def kms_screen_fields(screen_id: str, detail: bool = False):
+    """detail=true also returns what was dropped (audit columns, grid/joined-table columns) and why,
+    plus each kept field's table/column/type -- use it to check KMS field data before a run."""
     try:
         hit = await kms_catalog.lookup_screen(screen_id)
         if hit is None:
             raise HTTPException(status_code=404, detail=f"'{screen_id}' is not a screen in KMS")
-        names = await kms_catalog.get_screen_field_names(hit["screen_id"])
+        info = await kms_catalog.get_screen_fields(hit["screen_id"])
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"KMS unavailable: {e}")
-    return {"screen": hit, "fields": names}
+    names = [f["name"] for f in info["fields"]]
+    if not detail:
+        return {"screen": hit, "fields": names}
+    return {"screen": hit, "fields": names, "mainTable": info["mainTable"],
+            "totalInKms": info["totalInKms"], "kept": info["fields"], "dropped": info["dropped"]}
+
+
+@router.get("/modules", summary="Every KMS module code and the APM module it resolves to")
+async def kms_modules():
+    """matchedBy = alias | exact | fuzzy | none. For 'none', /generate relies on the LLM fallback;
+    add the code to localedata/module_aliases.json to make it deterministic."""
+    try:
+        return {"modules": await kms_catalog.module_report()}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"KMS unavailable: {e}")

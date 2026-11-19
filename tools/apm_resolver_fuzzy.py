@@ -73,13 +73,15 @@ def iter_save_operations(spec: dict):
         yield path, operation_id, entity, schema_name
 
 
-def resolve_save_endpoint(spec: dict, screen_query: str) -> ResolvedEndpoint | None:
-    q = _normalize(screen_query)
+def resolve_save_endpoint(spec: dict, screen_query: "str | list[str]") -> ResolvedEndpoint | None:
+    """screen_query may be one string or several alternates (e.g. the KMS display name AND the
+    screen id's tail); an endpoint scores as its best match against any of them."""
+    queries = [_normalize(q) for q in ([screen_query] if isinstance(screen_query, str) else screen_query) if q]
     scored = []
     for path, operation_id, entity, schema_name in iter_save_operations(spec):
         if not schema_name:
             continue
-        score = _similarity(_normalize(entity), q)
+        score = max((_similarity(_normalize(entity), q) for q in queries), default=0.0)
         scored.append((score, path, operation_id, entity, schema_name))
 
     if not scored:

@@ -78,7 +78,7 @@ async def _llm_resolve_endpoint(spec: dict, query: str) -> dict:
     return await _ask_llm(f"scope: endpoint\nquery: {query}\n\ncandidates:\n{json.dumps(candidates)}")
 
 
-async def _resolve_uncached(module_query: str, screen_query: str) -> dict:
+async def _resolve_uncached(module_query: str, screen_query: str, screen_aliases: list[str] | None = None) -> dict:
     module_match = fuzzy.resolve_module(module_query)
     if module_match is None or module_match.confidence < MODULE_LLM_FALLBACK_THRESHOLD:
         agent_result = await _llm_resolve_module(module_query)
@@ -97,7 +97,7 @@ async def _resolve_uncached(module_query: str, screen_query: str) -> dict:
     except Exception as e:
         return {"ok": False, "error": f"Could not fetch APM schema for module '{module_match.module}': {e}"}
 
-    endpoint_match = fuzzy.resolve_save_endpoint(spec, screen_query)
+    endpoint_match = fuzzy.resolve_save_endpoint(spec, [screen_query, *(screen_aliases or [])])
     if endpoint_match is None or endpoint_match.confidence < ENDPOINT_LLM_FALLBACK_THRESHOLD:
         agent_result = await _llm_resolve_endpoint(spec, screen_query)
         if "error" not in agent_result:
@@ -125,7 +125,7 @@ async def _resolve_uncached(module_query: str, screen_query: str) -> dict:
     }
 
 
-async def resolve_apm_schema(module_query: str, screen_query: str, force_refresh: bool = False) -> dict:
+async def resolve_apm_schema(module_query: str, screen_query: str, force_refresh: bool = False, screen_aliases: list[str] | None = None) -> dict:
     """
     Resolve module_query/screen_query to a real APM Save endpoint + its
     request schema. Cached per (module, screen) so the same screen is
@@ -136,10 +136,12 @@ async def resolve_apm_schema(module_query: str, screen_query: str, force_refresh
     {"ok": False, "error": str} on failure — generation still proceeds on
     failure (see steps/apm_schema_resolution.py), only Save is disabled.
     """
+    # screen_aliases (alternate names for the same screen) only help the first resolution; they are
+    # not part of the cache key so /save-row finds the same cached result /generate produced.
     cache_key = f"{module_query}|{screen_query}"
     if not force_refresh and cache_key in _resolution_cache:
         return _resolution_cache[cache_key]
 
-    result = await _resolve_uncached(module_query, screen_query)
+    result = await _resolve_uncached(module_query, screen_query, screen_aliases)
     _resolution_cache[cache_key] = result
     return result
