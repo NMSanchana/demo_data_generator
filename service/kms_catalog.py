@@ -79,14 +79,14 @@ def _cache_seconds() -> int:
         return 300
 
 
-async def _scroll(client: httpx.AsyncClient, flt: dict, include: list[str]) -> list[dict]:
+async def _scroll(client: httpx.AsyncClient, flt: dict, include: list[str], page_size: int = PAGE_SIZE) -> list[dict]:
     """Scrolls every point matching `flt`, returning only the requested payload keys."""
     base, collection, headers = _cfg()
     out: list[dict] = []
     offset = None
     while True:
         body: dict[str, Any] = {
-            "limit": PAGE_SIZE,
+            "limit": page_size,
             "with_payload": {"include": include},
             "with_vector": False,
             "filter": flt,
@@ -742,6 +742,35 @@ async def get_screen_fields(screen_id: str) -> dict:
     result = select_screen_fields(pts)
     _fields_cache[key] = (time.time(), result)
     return result
+
+
+_FIELD_INDEX_SECONDS = 1800
+_field_index: tuple[float, dict[str, int]] | None = None
+_field_index_lock = asyncio.Lock()
+
+
+async def screens_with_fields() -> dict[str, int]:
+    """{SCREEN_ID (upper-case): number of FieldKnowledge points KMS holds for it}.
+
+    A screen that is NOT in this map has no field data in KMS, so /generate would have to fall
+    back to parsing its source in GitLab. One payload-light scan (screen_id only), cached 30 min.
+    """
+    global _field_index
+    if _field_index and (time.time() - _field_index[0]) < _FIELD_INDEX_SECONDS:
+        return _field_index[1]
+    async with _field_index_lock:
+        if _field_index and (time.time() - _field_index[0]) < _FIELD_INDEX_SECONDS:
+            return _field_index[1]
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+            pts = await _scroll(client, _type_filter("FieldKnowledge"), ["screen_id"], page_size=5000)
+        counts: dict[str, int] = {}
+        for p in pts:
+            sid = str(p.get("screen_id") or "").strip().upper()
+            if sid:
+                counts[sid] = counts.get(sid, 0) + 1
+        _field_index = (time.time(), counts)
+        logger.info("kms_catalog: field index built -- %d screens have field data (%d field points)", len(counts), len(pts))
+        return counts
 
 
 async def get_screen_field_names(screen_id: str) -> list[str]:

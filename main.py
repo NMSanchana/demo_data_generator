@@ -29,6 +29,17 @@ from routers import profiles, targets, workspaces, schedules, approvals, masking
 
 load_dotenv()
 
+# --- Generation-only controls (all optional, set in .env) -------------------
+# APM_ENABLED=false  -> skip every APM / swagger / foreign-key lookup. Generation
+#                       then needs only KMS (or GitLab) + OpenAI. Push-to-APM is off.
+# MAX_FIELDS_PER_SCREEN -> some KMS screens hold hundreds of fields. Only the first N
+#                       (mandatory fields first) are generated. 0 = no cap.
+APM_ENABLED = os.getenv("APM_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+try:
+    MAX_FIELDS_PER_SCREEN = int(os.getenv("MAX_FIELDS_PER_SCREEN", "40"))
+except ValueError:
+    MAX_FIELDS_PER_SCREEN = 40
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
@@ -140,7 +151,20 @@ async def _resolve_feature_screens(features: list) -> list[dict]:
                 })
                 continue
 
-            resolved = await architecture_agent.resolve_screen(module, screen)
+            # GitLab is only the fallback for screens KMS has no fields for. If it is unreachable or
+            # misconfigured, that ONE screen fails with a clear message -- not the whole request (500).
+            try:
+                resolved = await architecture_agent.resolve_screen(module, screen)
+            except Exception as e:
+                logger.warning("feature_resolver: GitLab fallback failed for %r (%s)", screen, e)
+                out.append({
+                    "ok": False, "feature": feat, "data_template": data_template, "screen_name": screen,
+                    "error": (
+                        f"KMS has no field data for '{screen}' (screen id {screen_id}), and the GitLab fallback failed: {e}. "
+                        "Check SOURCE_GITLAB_TOKEN, SOURCE_GITLAB_PROJECT_ID and SOURCE_GITLAB_BRANCH in .env."
+                    ),
+                })
+                continue
             if not resolved.get("ok"):
                 out.append({"ok": False, "feature": feat, "data_template": data_template, "screen_name": screen, "error": resolved.get("error", "Resolution failed")})
                 continue
@@ -180,11 +204,21 @@ async def generate(request: GenerateRequest):
             screen_contexts.append({"ok": False, "feature": feat, "data_template": r["data_template"], "screen_name": r["screen_name"], "error": "No form fields found on this screen."})
             continue
 
+        if MAX_FIELDS_PER_SCREEN > 0 and len(fields) > MAX_FIELDS_PER_SCREEN:
+            logger.info(
+                "generate: %s has %d fields -- using the first %d (MAX_FIELDS_PER_SCREEN)",
+                r["screen_name"], len(fields), MAX_FIELDS_PER_SCREEN,
+            )
+            fields = fields[:MAX_FIELDS_PER_SCREEN]
+
         # APM gets the APM-side module name and, as alternates for matching the Save endpoint,
         # the KMS screen id's tail (e.g. "ACCOUNTS_MACCOUNT" -> "MACCOUNT") besides the display name.
         sid = r.get("screen_id") or ""
         aliases = [sid.split("_", 1)[1]] if "_" in sid else ([sid] if sid else [])
-        apm_resolution = await resolve_for_generation(r["apm_module"], r["screen_name"], aliases)
+        if APM_ENABLED:
+            apm_resolution = await resolve_for_generation(r["apm_module"], r["screen_name"], aliases)
+        else:
+            apm_resolution = {"ok": False, "error": "APM is switched off (APM_ENABLED=false) -- preview only."}
 
         screen_contexts.append({
             "ok": True,

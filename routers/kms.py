@@ -56,3 +56,13 @@ async def kms_modules():
         return {"modules": await kms_catalog.module_report()}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"KMS unavailable: {e}")
+
+
+@router.get("/screens-with-fields", summary="Which screens have field data in KMS (these generate without GitLab)")
+async def kms_screens_with_fields():
+    """{screens: {SCREEN_ID: number of field records}}. A screen missing here has no KMS field data."""
+    try:
+        counts = await kms_catalog.screens_with_fields()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"KMS unavailable: {e}")
+    return {"count": len(counts), "screens": counts}

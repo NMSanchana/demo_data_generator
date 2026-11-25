@@ -151,11 +151,30 @@ def _build_user_message(state: dict) -> str:
         )
         parts.append(json.dumps(relevant_pools))
 
+    already = state.get("already_generated") or {}
+    if already:
+        parts.append("")
+        parts.append(
+            "already_generated (an earlier batch of this same request already produced "
+            "these values. Do NOT repeat any of them, and continue identifier numbering "
+            "after them):"
+        )
+        parts.append(json.dumps(already))
+
     parts.append("")
     parts.append("fields:")
     parts.append(json.dumps(fields))
 
     return "\n".join(parts)
+
+
+def _rows_per_call() -> int:
+    """Rows asked for in ONE LLM call. A single call for many rows x many fields can exceed the
+    model's output limit and come back cut off (broken JSON), so big requests are split."""
+    try:
+        return max(1, int(os.getenv("ROWS_PER_LLM_CALL", "5")))
+    except ValueError:
+        return 5
 
 
 async def data_generator_agent_node(state: dict) -> dict:
@@ -175,20 +194,44 @@ async def data_generator_agent_node(state: dict) -> dict:
         bool(state.get("apm_type_hints")),
     )
 
+    total = state.get("row_count") or DEFAULT_ROW_COUNT
+    per_call = _rows_per_call()
     system_prompt = _load_prompt("data_generator_prompt.txt")
-    user_message = _build_user_message(state)
-    result = await _ask_llm_json(system_prompt, user_message, temperature=0.8)
+    id_like = [f["field_name"] for f in fields if f.get("kind") in ("identifier", "name")]
 
-    if "error" in result:
-        return {"generated_rows": [], "resolved_geography": None, "generation_error": result["error"]}
-
-    rows = result.get("rows") or []
-    if not rows:
-        return {"generated_rows": [], "resolved_geography": None, "generation_error": "Agent returned no rows."}
-
+    rows: list[dict] = []
     resolved_geography = None
-    if state.get("geography"):
-        resolved_geography = result.get("resolved_geography") or state["geography"]
+    batch_state = dict(state)
+
+    while len(rows) < total:
+        want = min(per_call, total - len(rows))
+        batch_state["row_count"] = want
+        if rows:
+            seen = {n: [str(r[n]) for r in rows if r.get(n) is not None] for n in id_like}
+            batch_state["already_generated"] = {n: v for n, v in seen.items() if v}
+
+        result = await _ask_llm_json(system_prompt, _build_user_message(batch_state), temperature=0.8)
+
+        if "error" in result:
+            if rows:
+                logger.warning("data_generator_agent_node: a later batch failed (%s) -- keeping the %d row(s) already generated", result["error"], len(rows))
+                break
+            return {"generated_rows": [], "resolved_geography": None, "generation_error": result["error"]}
+
+        batch = [r for r in (result.get("rows") or []) if isinstance(r, dict)]
+        if not batch:
+            if rows:
+                break
+            return {"generated_rows": [], "resolved_geography": None, "generation_error": "Agent returned no rows."}
+
+        rows.extend(batch[:want])
+        logger.info("data_generator_agent_node: batch of %d done (%d/%d rows)", len(batch[:want]), len(rows), total)
+
+        # The first batch resolves the typed place; later batches reuse it unchanged.
+        if state.get("geography") and resolved_geography is None:
+            resolved_geography = result.get("resolved_geography") or state["geography"]
+            batch_state["geography"] = resolved_geography
+            batch_state["geography_already_resolved"] = True
 
     logger.info("data_generator_agent_node: generated %d row(s)", len(rows))
     return {"generated_rows": rows, "resolved_geography": resolved_geography, "generation_error": None}
