@@ -1,4 +1,10 @@
+import hashlib
+import json
+import re
+
 from fastapi import APIRouter, HTTPException
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import Response
 from service import profiles_service, profile_db, run_store
 
 router = APIRouter(prefix="/api/v1/store", tags=["profiles"])
@@ -42,6 +48,26 @@ async def create_profile_db(profile_id: str):
 async def get_profile_runs(profile_id: str):
     """The stored versions (v1, v2, ...) of this profile's data, newest first."""
     return await run_store.list_runs(profile_id)
+
+
+@router.get("/GetRunBundle/{profile_id}/{run_id}")
+async def get_run_bundle(profile_id: str, run_id: int):
+    """Download one stored version (details, screens and rows) as a JSON file."""
+    bundle = await run_store.get_bundle(profile_id, run_id)
+    if bundle is None:
+        raise HTTPException(status_code=404, detail="Version not found")
+    body = json.dumps(jsonable_encoder(bundle), ensure_ascii=False, indent=2).encode("utf-8")
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", profile_id).strip("_") or "profile"
+    filename = f"{slug}-v{bundle['version']['version_no']}.json"
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Bundle-SHA256": hashlib.sha256(body).hexdigest(),
+            "Access-Control-Expose-Headers": "Content-Disposition, X-Bundle-SHA256",
+        },
+    )
 
 
 @router.get("/GetRules")

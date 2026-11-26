@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -182,6 +183,7 @@ async def _resolve_feature_screens(features: list) -> list[dict]:
 
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(request: GenerateRequest):
+    started = time.monotonic()  # real generation time, stored with the version
     domain_value = request.domain
     subdomain_value = request.subdomain or None
     # Raw, as-typed geography text, resolved to a real place by the first
@@ -349,6 +351,7 @@ async def generate(request: GenerateRequest):
         "catalog_version": request.profile.catalog_version, "mode": request.profile.mode, "seed": request.profile.seed,
         "target_id": request.profile.target_id, "target_name": request.profile.target_name,
         "row_count": request.row_count,
+        "duration_seconds": round(time.monotonic() - started, 1),
     }
     storage = await run_store.save_run(request.profile.id, meta, results)
 

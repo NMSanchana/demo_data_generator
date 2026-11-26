@@ -10,6 +10,7 @@ small dict describing what happened, which /generate passes back to the UI.
 """
 
 import logging
+from datetime import datetime, timezone
 
 import asyncpg
 
@@ -34,7 +35,19 @@ async def _save(conn: asyncpg.Connection, meta: dict, results: list) -> dict:
         appended = current is not None
         if appended:
             run_id, version_no = current["id"], current["version_no"]
-            await conn.execute("UPDATE dd_runs SET finished_at = NOW() WHERE id = $1", run_id)
+            # A top-up adds its own generation time to the version's total (only when that version has one).
+            await conn.execute(
+                """
+                UPDATE dd_runs
+                SET finished_at = NOW(),
+                    params = CASE WHEN params ? 'duration_seconds'
+                                  THEN jsonb_set(params, '{duration_seconds}',
+                                                 to_jsonb((params->>'duration_seconds')::float + $2::float))
+                                  ELSE params END
+                WHERE id = $1
+                """,
+                run_id, float(meta.get("duration_seconds") or 0),
+            )
         else:
             version_no = (await conn.fetchval("SELECT COALESCE(MAX(version_no), 0) + 1 FROM dd_runs")) or 1
             await conn.execute("UPDATE dd_runs SET is_current = FALSE WHERE is_current")
@@ -49,7 +62,12 @@ async def _save(conn: asyncpg.Connection, meta: dict, results: list) -> dict:
                 version_no, bool(meta.get("top_up")), meta.get("domain"), meta.get("subdomain"), meta.get("geography"),
                 meta.get("resolved_geography"), meta.get("catalog_version"), meta.get("mode"), meta.get("seed"),
                 meta.get("target_id"), meta.get("target_name"), meta.get("row_count"),
-                {"features": [r.feature_id for r in results if r.feature_id]},
+                {
+                    "features": [r.feature_id for r in results if r.feature_id],
+                    # Real wall-clock time of the request. started_at/finished_at cannot show this: both come from
+                    # NOW(), which Postgres freezes at the start of the transaction.
+                    "duration_seconds": meta.get("duration_seconds"),
+                },
             )
 
         rows_saved = 0
@@ -142,20 +160,109 @@ async def save_run(profile_id: str, meta: dict, results: list) -> dict:
     return info
 
 
+_RUNS_SQL = """
+SELECT r.id, r.version_no, r.is_current, r.top_up, r.domain, r.subdomain, r.geography, r.resolved_geography,
+       r.catalog_version, r.mode, r.seed, r.target_name, r.note, r.started_at, r.finished_at,
+       (r.params->>'duration_seconds')::float AS duration_seconds,
+       COUNT(s.id) AS screens,
+       COUNT(s.id) FILTER (WHERE s.status = 'ok') AS ok_screens,
+       COUNT(s.id) FILTER (WHERE s.status <> 'ok') AS error_screens,
+       COALESCE(SUM(s.row_count), 0) AS row_count
+FROM dd_runs r LEFT JOIN dd_run_screens s ON s.run_id = r.id
+GROUP BY r.id ORDER BY r.version_no DESC
+"""
+
+
+def _outcome(ok_screens: int, error_screens: int) -> str:
+    """completed = every screen worked, partial = some failed, failed = none worked."""
+    if ok_screens == 0 and error_screens == 0:
+        return "empty"
+    if error_screens == 0:
+        return "completed"
+    return "failed" if ok_screens == 0 else "partial"
+
+
+def _shape(row: asyncpg.Record, profile: dict) -> dict:
+    d = dict(row)
+    d["row_count"] = int(d["row_count"] or 0)
+    d["status"] = _outcome(d["ok_screens"], d["error_screens"])
+    d["last_activity"] = d["finished_at"] or d["started_at"]
+    d["profile_id"] = profile["id"]
+    d["profile_name"] = profile.get("name") or profile["id"]
+    return d
+
+
+async def _runs_for_profile(profile: dict) -> list[dict]:
+    db_name = profile.get("db_name") or profile_db.db_name_for(profile["id"])
+    pool = await profile_db.get_profile_pool(db_name)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(_RUNS_SQL)
+    return [_shape(r, profile) for r in rows]
+
+
 async def list_runs(profile_id: str) -> list[dict]:
     """Versions of one profile, newest first, with screen and row totals."""
     profile = await profiles_service.get_profile(profile_id)
     if not profile or profile.get("db_status") != "ready":
         return []
+    return await _runs_for_profile(profile)
+
+
+async def list_all_runs(limit: int | None = None) -> list[dict]:
+    """Versions of every profile, most recently active first. A profile whose database cannot be read is skipped
+    (and logged) so one broken profile never hides the others. Profiles are read one after another because only a
+    few profile pools are kept open at once."""
+    out: list[dict] = []
+    for profile in await profiles_service.list_profiles():
+        if profile.get("db_status") != "ready":
+            continue
+        try:
+            out.extend(await _runs_for_profile(profile))
+        except Exception:  # noqa: BLE001
+            logger.exception("run_store: could not read the versions of profile %s", profile.get("id"))
+    oldest = datetime.min.replace(tzinfo=timezone.utc)
+    out.sort(key=lambda r: r["last_activity"] or oldest, reverse=True)
+    return out[:limit] if limit else out
+
+
+async def get_bundle(profile_id: str, run_id: int) -> dict | None:
+    """Everything stored for one version (details, screens, fields and rows) as one JSON-ready dict, or None."""
+    profile = await profiles_service.get_profile(profile_id)
+    if not profile or profile.get("db_status") != "ready":
+        return None
     pool = await profile_db.get_profile_pool(profile.get("db_name") or profile_db.db_name_for(profile_id))
     async with pool.acquire() as conn:
+        run = await conn.fetchrow("SELECT * FROM dd_runs WHERE id = $1", run_id)
+        if run is None:
+            return None
+        screens = await conn.fetch("SELECT * FROM dd_run_screens WHERE run_id = $1 ORDER BY id", run_id)
         rows = await conn.fetch(
-            """
-            SELECT r.id, r.version_no, r.is_current, r.top_up, r.domain, r.geography, r.resolved_geography,
-                   r.catalog_version, r.mode, r.seed, r.target_name, r.note, r.started_at, r.finished_at,
-                   COUNT(s.id) AS screens, COALESCE(SUM(s.row_count), 0) AS row_count
-            FROM dd_runs r LEFT JOIN dd_run_screens s ON s.run_id = r.id
-            GROUP BY r.id ORDER BY r.version_no DESC
-            """
+            "SELECT run_screen_id, data FROM dd_rows WHERE run_id = $1 ORDER BY run_screen_id, row_index", run_id
         )
-    return [dict(r) for r in rows]
+
+    rows_by_screen: dict[int, list] = {}
+    for r in rows:
+        rows_by_screen.setdefault(r["run_screen_id"], []).append(r["data"])
+
+    version = {k: run[k] for k in (
+        "version_no", "is_current", "top_up", "domain", "subdomain", "geography", "resolved_geography",
+        "catalog_version", "mode", "seed", "target_name", "note", "started_at", "finished_at",
+    )}
+    version["duration_seconds"] = (run["params"] or {}).get("duration_seconds")
+    return {
+        "format": "demo-data-bundle",
+        "format_version": 1,
+        "exported_at": datetime.now(timezone.utc),
+        "profile": {"id": profile["id"], "name": profile.get("name")},
+        "version": version,
+        "screens": [
+            {
+                "screen": s["screen"], "screen_id": s["screen_id"], "module": s["module"], "kms_module": s["kms_module"],
+                "feature_id": s["feature_id"], "feature_name": s["feature_name"],
+                "status": s["status"], "message": s["message"], "apm_ready": s["apm_ready"],
+                "fields": s["fields"], "row_count": s["row_count"],
+                "rows": rows_by_screen.get(s["id"], []),
+            }
+            for s in screens
+        ],
+    }
