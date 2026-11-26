@@ -23,6 +23,13 @@ CREATE TABLE IF NOT EXISTS ddpa_profiles (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Per-profile database bookkeeping (see service/profile_db.py). Idempotent for databases created before this existed.
+ALTER TABLE ddpa_profiles ADD COLUMN IF NOT EXISTS db_name         TEXT;
+ALTER TABLE ddpa_profiles ADD COLUMN IF NOT EXISTS db_status       TEXT NOT NULL DEFAULT 'none';
+ALTER TABLE ddpa_profiles ADD COLUMN IF NOT EXISTS db_error        TEXT;
+ALTER TABLE ddpa_profiles ADD COLUMN IF NOT EXISTS db_created_at   TIMESTAMPTZ;
+ALTER TABLE ddpa_profiles ADD COLUMN IF NOT EXISTS current_version INT;
+
 -- Applicability rules
 CREATE TABLE IF NOT EXISTS ddpa_rules (
     id            TEXT PRIMARY KEY,

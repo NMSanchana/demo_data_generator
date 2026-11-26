@@ -144,7 +144,44 @@ def _validate_constraints(field_name: str, value, field_schema: dict) -> None:
         )
 
 
-async def map_row_to_schema(row: dict, scalar_fields: dict, screen_name: str) -> dict:
+def _fill_system_fields(body: dict, scalar_fields: dict, login: dict | None) -> list[str]:
+    """
+    Fills identity/audit/bookkeeping fields from the Login (see service.apm_session).
+    Returns the names of the fields it filled so the response can say so.
+
+      - identity/audit fields (CreatedById, TenantId, ...) always come from the login;
+      - Version/Status/SortOrder get 0 only if the row had nothing;
+      - the record's own primary key (first integer field named *Id) is 0 = "new record".
+    """
+    if login is None:
+        return []
+    from service.apm_session import system_values  # local import: keeps this module importable alone
+
+    always, default_if_missing = system_values(login)
+    filled: list[str] = []
+
+    for name, value in always.items():
+        if name in scalar_fields:
+            body[name] = value
+            filled.append(name)
+
+    for name, value in default_if_missing.items():
+        if name in scalar_fields and _is_empty(body.get(name)):
+            body[name] = value
+            filled.append(name)
+
+    # New record: the primary key is the first property and is an integer ending in "Id".
+    for name, meta in scalar_fields.items():
+        if (meta or {}).get("type") == "integer" and name.endswith("Id"):
+            if name not in body and name not in always:
+                body[name] = 0
+                filled.append(name)
+        break
+
+    return filled
+
+
+async def map_row_to_schema(row: dict, scalar_fields: dict, screen_name: str, login: dict | None = None) -> dict:
     """
     Maps a generated/edited frontend row onto the real APM save schema.
 
@@ -227,6 +264,13 @@ async def map_row_to_schema(row: dict, scalar_fields: dict, screen_name: str) ->
 
     unmatched_frontend_fields = sorted(remaining_row_keys)
 
+    # Fill the system fields from the Login, then stop reporting them as missing.
+    filled_from_login = _fill_system_fields(body, scalar_fields, login)
+    if filled_from_login:
+        done = set(filled_from_login)
+        unmatched_apm_fields = [f for f in unmatched_apm_fields if f not in done]
+        missing_required_fields = [f for f in missing_required_fields if f not in done]
+
     if missing_required_fields:
         logger.warning(
             "row_mapper: screen %r save is missing required APM fields: %s",
@@ -248,4 +292,5 @@ async def map_row_to_schema(row: dict, scalar_fields: dict, screen_name: str) ->
         "missing_required_fields": missing_required_fields,
         "unmatched_apm_fields": unmatched_apm_fields,
         "unmatched_frontend_fields": unmatched_frontend_fields,
+        "filled_from_login": filled_from_login,
     }

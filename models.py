@@ -113,9 +113,21 @@ class ScreenResult(BaseModel):
     )
 
 
+class StorageInfo(BaseModel):
+    """What happened when this run was stored in the profile's own database."""
+    saved:        bool = False
+    version_no:   int | None = None
+    run_id:       int | None = None
+    appended:     bool = Field(False, description="True when 'top up' added to the current version instead of creating a new one")
+    rows_saved:   int = 0
+    db_name:      str | None = None
+    error:        str | None = None
+
+
 class GenerateResponse(BaseModel):
     profile_id: str
     results:    list[ScreenResult] = []
+    storage:    StorageInfo | None = None
 
 
 class SaveRowRequest(BaseModel):
@@ -128,6 +140,15 @@ class SaveRowResponse(BaseModel):
     ok:          bool
     status_code: int | None = None
     error:       str | None = None
+    detail:      str | None = Field(
+        None, description="APM's own explanation of a failure (ErrorBody / ErrorInnerException), verbatim."
+    )
+    url:         str | None = Field(None, description="The exact URL the row was posted to (shows which APM host was used).")
+    filled_from_login: list[str] = Field(
+        default_factory=list,
+        description="System/audit fields (CreatedById, TenantId, ...) filled from the Login header.",
+    )
+    login_warnings: list[str] = Field(default_factory=list, description="Problems spotted in the Login header.")
     response:    Any = None
     missing_required_fields: list[str] = Field(
         default_factory=list,

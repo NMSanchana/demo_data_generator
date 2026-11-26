@@ -30,14 +30,22 @@ async def _init_connection(conn):
     )
 
 
+def connection_kwargs(database: str | None = None) -> dict:
+    """Connection settings for the shared PG server. database=None -> the main platform DB (PG_DB).
+    Per-profile databases live on the same server with the same credentials (see service/profile_db.py)."""
+    return dict(
+        host=os.getenv("PG_HOST", "217.217.249.121"),
+        port=int(os.getenv("PG_PORT", "5432")),
+        database=database or os.getenv("PG_DB", "DEMO_DATA"),
+        user=os.getenv("PG_USER", "gbuser"),
+        password=os.getenv("PG_PASSWORD", "aidev123"),
+    )
+
+
 async def init_pool() -> None:
     global _pool
     _pool = await asyncpg.create_pool(
-        host=os.getenv("PG_HOST", "217.217.249.121"),
-        port=int(os.getenv("PG_PORT", "5432")),
-        database=os.getenv("PG_DB", "DEMO_DATA"),
-        user=os.getenv("PG_USER", "gbuser"),
-        password=os.getenv("PG_PASSWORD", "aidev123"),
+        **connection_kwargs(),
         min_size=2,
         max_size=10,
         init=_init_connection,

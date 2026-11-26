@@ -1,6 +1,11 @@
 """CRUD for profiles and applicability rules."""
 import json
+import logging
+
+from service import profile_db
 from service.postgres_client import get_pool
+
+logger = logging.getLogger(__name__)
 
 
 # ── Profiles ──────────────────────────────────────────────────────────────────
@@ -33,7 +38,7 @@ async def upsert_profile(p: dict) -> dict:
                 overrides       = EXCLUDED.overrides,
                 catalog_version = EXCLUDED.catalog_version,
                 updated_at      = NOW()
-            RETURNING *
+            RETURNING *, (xmax = 0) AS inserted
         """,
         p["id"], p["name"], p.get("description", ""),
         p.get("status", "draft"),
@@ -41,14 +46,36 @@ async def upsert_profile(p: dict) -> dict:
         p.get("overrides", {}),
         p.get("catalogVersion") or p.get("catalog_version"),
         )
-        return dict(row)
+        result = dict(row)
+
+    # A brand-new profile gets its own database right away. Later edits never re-create it (the page saves
+    # on every change); a failure is recorded on the profile (db_status='error') and never blocks the save.
+    if result.pop("inserted", False):
+        await profile_db.ensure_profile_db(result["id"])
+        refreshed = await get_profile(result["id"])
+        if refreshed:
+            result = refreshed
+    return result
 
 
 async def delete_profile(profile_id: str) -> bool:
+    """Delete the profile AND drop its database with every version in it."""
+    existing = await get_profile(profile_id)
+    if existing is None:
+        return False
+    db_name = existing.get("db_name") or profile_db.db_name_for(profile_id)
+
     pool = get_pool()
     async with pool.acquire() as conn:
         result = await conn.execute("DELETE FROM ddpa_profiles WHERE id = $1", profile_id)
-        return result == "DELETE 1"
+    if result != "DELETE 1":
+        return False
+
+    try:
+        await profile_db.drop_database(db_name)
+    except Exception:  # noqa: BLE001 -- the profile is already gone; leave the DB and say so in the log
+        logger.exception("profile_db: could not drop %s after deleting profile %s -- drop it manually", db_name, profile_id)
+    return True
 
 
 # ── Rules ─────────────────────────────────────────────────────────────────────

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 
@@ -11,11 +12,14 @@ from models import (
     ScreenResult,
     SaveRowRequest,
     SaveRowResponse,
+    StorageInfo,
 )
 from workflow.graph import generator_graph
 from service.apm_client import execute_save
+from service.apm_session import parse_login, login_warnings
 from service import feature_resolver
 from service.postgres_client import init_pool, close_pool
+from service import profile_db, run_store
 from Agents import architecture_agent
 from Agents.apm_resolver_agent import resolve_apm_schema
 from Agents.data_generator_agent import build_entity_assignment_map
@@ -81,10 +85,13 @@ app.include_router(kms.router)
 async def on_startup():
     await init_pool()
     await run_migrations()
+    # give every existing profile a database (in the background, so startup is not held up)
+    app.state.backfill_task = asyncio.create_task(profile_db.backfill_profile_dbs())
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    await profile_db.close_all_pools()
     await close_pool()
 
 
@@ -334,7 +341,18 @@ async def generate(request: GenerateRequest):
             resolved_geography=final_state.get("resolved_geography"),
         ))
 
-    return GenerateResponse(profile_id=request.profile.id, results=results)
+    # Store this run as the next version in the profile's own database. Best effort: never fails the request.
+    meta = {
+        "top_up": request.profile.top_up,
+        "domain": domain_value, "subdomain": subdomain_value, "geography": raw_geography,
+        "resolved_geography": next((r.resolved_geography for r in results if r.resolved_geography), None),
+        "catalog_version": request.profile.catalog_version, "mode": request.profile.mode, "seed": request.profile.seed,
+        "target_id": request.profile.target_id, "target_name": request.profile.target_name,
+        "row_count": request.row_count,
+    }
+    storage = await run_store.save_run(request.profile.id, meta, results)
+
+    return GenerateResponse(profile_id=request.profile.id, results=results, storage=StorageInfo(**storage))
 
 
 # ---------------------------------------------------------------------
@@ -347,17 +365,31 @@ async def save_row(request: SaveRowRequest, raw_request: Request):
     if not login_header.strip():
         raise HTTPException(status_code=400, detail="A Login header is required to save to APM.")
 
+    # The header itself is forwarded to APM unchanged; here we only READ it to fill system fields
+    # and to catch a malformed paste early with a clear message.
+    login, login_problem = parse_login(login_header)
+    if login is None:
+        return SaveRowResponse(ok=False, error=login_problem)
+
     resolution = await resolve_apm_schema(request.module, request.screen)
     if not resolution.get("ok"):
-        return SaveRowResponse(ok=False, error=resolution.get("error"))
+        return SaveRowResponse(ok=False, error=resolution.get("error"), login_warnings=login_warnings(login))
 
-    mapping = await map_row_to_schema(request.row, resolution["scalar_fields"], request.screen)
+    mapping = await map_row_to_schema(request.row, resolution["scalar_fields"], request.screen, login)
     result = await execute_save(resolution["path_prefix"], resolution["endpoint_path"], login_header, mapping["body"])
+
+    logger.info(
+        "save-row: screen=%r db=%r user=%r -> %s ok=%s",
+        request.screen, login.get("DatabaseName"), login.get("UserCode"), result.get("url"), result["ok"],
+    )
 
     return SaveRowResponse(
         ok=result["ok"], status_code=result["status_code"],
-        error=result["error"], response=result["response"],
+        error=result["error"], detail=result.get("detail"), url=result.get("url"),
+        response=result["response"],
         missing_required_fields=mapping["missing_required_fields"],
         unmatched_apm_fields=mapping["unmatched_apm_fields"],
         unmatched_frontend_fields=mapping["unmatched_frontend_fields"],
+        filled_from_login=mapping.get("filled_from_login", []),
+        login_warnings=login_warnings(login),
     )
