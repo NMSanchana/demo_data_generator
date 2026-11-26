@@ -94,6 +94,12 @@ class ScreenResult(BaseModel):
     fields:                 list[dict] = []
     rows:                   list[dict] = []
     row_count:              int = 0
+    fields_total:           int | None = Field(
+        None, description="How many fields the screen has in total (before any MAX_FIELDS_PER_SCREEN limit)"
+    )
+    fields_capped:          bool = Field(
+        False, description="True when only the first MAX_FIELDS_PER_SCREEN fields were generated"
+    )
     apm_ready:              bool = False
     apm_disabled_reason:    str | None = None
     resolved_geography:     str | None = Field(

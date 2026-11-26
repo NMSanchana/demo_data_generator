@@ -3,30 +3,15 @@ import logging
 import os
 from pathlib import Path
 
-from openai import AsyncOpenAI
 from dotenv import load_dotenv
+
+from Agents.llm import get_client, get_model
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-_client: AsyncOpenAI | None = None
-
 DEFAULT_ROW_COUNT = 20
-
-
-def _get_client() -> AsyncOpenAI:
-    global _client
-    if _client is None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY must be set in .env")
-        _client = AsyncOpenAI(api_key=api_key)
-    return _client
-
-
-def _model() -> str:
-    return os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
 def _load_prompt(filename: str) -> str:
@@ -34,10 +19,10 @@ def _load_prompt(filename: str) -> str:
 
 
 async def _ask_llm_json(system_prompt: str, user_message: str, temperature: float) -> dict:
-    client = _get_client()
+    client = get_client()
     try:
         response = await client.chat.completions.create(
-            model=_model(),
+            model=get_model(),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},

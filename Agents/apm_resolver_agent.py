@@ -1,10 +1,10 @@
 import json
 import logging
-import os
 from pathlib import Path
 
-from openai import AsyncOpenAI
 from dotenv import load_dotenv
+
+from Agents.llm import get_client, get_model
 
 from localedata.apm_modules import APM_MODULES
 from service.apm_client import get_swagger_spec
@@ -17,8 +17,6 @@ logger = logging.getLogger(__name__)
 MODULE_LLM_FALLBACK_THRESHOLD = 0.75
 ENDPOINT_LLM_FALLBACK_THRESHOLD = 0.7
 
-_client: AsyncOpenAI | None = None
-
 # Per-module/screen resolution cache — the resolver only needs to hit the
 # APM module manifest + swagger.json once per screen; every subsequent
 # generate/save-row call for that screen reuses this (same pattern as the
@@ -27,29 +25,15 @@ _client: AsyncOpenAI | None = None
 _resolution_cache: dict[str, dict] = {}
 
 
-def _get_client() -> AsyncOpenAI:
-    global _client
-    if _client is None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY must be set in .env")
-        _client = AsyncOpenAI(api_key=api_key)
-    return _client
-
-
-def _model() -> str:
-    return os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-
 def _load_prompt() -> str:
     return (Path(__file__).resolve().parent.parent / "prompts" / "apm_resolver_prompt.txt").read_text(encoding="utf-8")
 
 
 async def _ask_llm(user_message: str) -> dict:
-    client = _get_client()
+    client = get_client()
     try:
         response = await client.chat.completions.create(
-            model=_model(),
+            model=get_model(),
             messages=[
                 {"role": "system", "content": _load_prompt()},
                 {"role": "user", "content": user_message},

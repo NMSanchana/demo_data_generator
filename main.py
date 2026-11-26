@@ -39,12 +39,14 @@ load_dotenv()
 # APM_ENABLED=false  -> skip every APM / swagger / foreign-key lookup. Generation
 #                       then needs only KMS (or GitLab) + OpenAI. Push-to-APM is off.
 # MAX_FIELDS_PER_SCREEN -> some KMS screens hold hundreds of fields. Only the first N
-#                       (mandatory fields first) are generated. 0 = no cap.
+#                       (mandatory fields first) are generated. 0 = no cap. When a screen is
+#                       capped, the response says so (fields_total / fields_capped) and the
+#                       Generator page shows a notice.
 APM_ENABLED = os.getenv("APM_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 try:
-    MAX_FIELDS_PER_SCREEN = int(os.getenv("MAX_FIELDS_PER_SCREEN", "40"))
+    MAX_FIELDS_PER_SCREEN = int(os.getenv("MAX_FIELDS_PER_SCREEN", "0"))
 except ValueError:
-    MAX_FIELDS_PER_SCREEN = 40
+    MAX_FIELDS_PER_SCREEN = 0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -229,7 +231,9 @@ async def generate(request: GenerateRequest):
             screen_contexts.append({"ok": False, "feature": feat, "data_template": r["data_template"], "screen_name": r["screen_name"], "error": "No form fields found on this screen."})
             continue
 
-        if MAX_FIELDS_PER_SCREEN > 0 and len(fields) > MAX_FIELDS_PER_SCREEN:
+        fields_total = len(fields)
+        fields_capped = MAX_FIELDS_PER_SCREEN > 0 and fields_total > MAX_FIELDS_PER_SCREEN
+        if fields_capped:
             logger.info(
                 "generate: %s has %d fields -- using the first %d (MAX_FIELDS_PER_SCREEN)",
                 r["screen_name"], len(fields), MAX_FIELDS_PER_SCREEN,
@@ -257,6 +261,8 @@ async def generate(request: GenerateRequest):
             "resolved_via": r["resolved_via"],
             "fields_source": r["fields_source"],
             "fields": fields,
+            "fields_total": fields_total,
+            "fields_capped": fields_capped,
             "apm_resolution": apm_resolution,
         })
 
@@ -354,6 +360,8 @@ async def generate(request: GenerateRequest):
             fields=ctx["fields"],
             rows=rows,
             row_count=len(rows),
+            fields_total=ctx.get("fields_total"),
+            fields_capped=bool(ctx.get("fields_capped")),
             apm_ready=apm_ready,
             apm_disabled_reason=None if apm_ready else apm_resolution.get("error"),
             resolved_geography=final_state.get("resolved_geography"),

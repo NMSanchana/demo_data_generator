@@ -1,10 +1,10 @@
 import json
 import logging
-import os
 from pathlib import Path
 
-from openai import AsyncOpenAI
 from dotenv import load_dotenv
+
+from Agents.llm import get_client, get_model
 
 from service.gitlab_service import get_gitlab_service
 from tools import architecture_resolver_fuzzy as fuzzy
@@ -15,32 +15,16 @@ logger = logging.getLogger(__name__)
 
 FUZZY_CONFIDENCE_THRESHOLD = 0.75
 
-_client: AsyncOpenAI | None = None
-
-
-def _get_client() -> AsyncOpenAI:
-    global _client
-    if _client is None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY must be set in .env")
-        _client = AsyncOpenAI(api_key=api_key)
-    return _client
-
-
-def _model() -> str:
-    return os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
 
 def _load_prompt() -> str:
     return (Path(__file__).resolve().parent.parent / "prompts" / "architecture_prompt.txt").read_text(encoding="utf-8")
 
 
 async def _ask_llm(user_message: str) -> dict:
-    client = _get_client()
+    client = get_client()
     try:
         response = await client.chat.completions.create(
-            model=_model(),
+            model=get_model(),
             messages=[
                 {"role": "system", "content": _load_prompt()},
                 {"role": "user", "content": user_message},
