@@ -29,8 +29,9 @@ from tools.schema_parser import classify_fields
 from steps.apm_schema_resolution import resolve_for_generation
 from tools.row_mapper import map_row_to_schema
 from localedata.domain import DOMAIN_LIST
+from localedata import apm_modules
 from service.table_setup import run_migrations
-from routers import profiles, targets, workspaces, schedules, approvals, masking, dimensions, dashboard, kms
+from routers import profiles, targets, dimensions, dashboard, kms
 
 load_dotenv()
 
@@ -63,20 +64,26 @@ app = FastAPI(
     version="3.0.0",
 )
 
+# Only the frontend's own address may call this API. Set CORS_ORIGINS in .env (comma separated) for any other.
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:8080,http://127.0.0.1:8080,http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=CORS_ORIGINS,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
 # Register store routers
 app.include_router(profiles.router)
 app.include_router(targets.router)
-app.include_router(workspaces.router)
-app.include_router(schedules.router)
-app.include_router(approvals.router)
-app.include_router(masking.router)
 app.include_router(dimensions.router)
 app.include_router(dashboard.router)
 app.include_router(kms.router)
@@ -108,6 +115,15 @@ async def health():
 @app.get("/meta/domains", summary="Full worldwide Domain list backing the searchable Domain dropdown (quick-pick only -- any typed value is also accepted)")
 def get_domains() -> dict:
     return {"domains": DOMAIN_LIST}
+
+
+@app.get("/meta/apm", summary="Which APM host rows are pushed to (read from .env) and whether pushing is switched on")
+def get_apm_info() -> dict:
+    try:
+        host = apm_modules._apm_api_host()
+    except RuntimeError:
+        host = None  # APM_DOC_HOST / APM_API_HOST not set in .env
+    return {"enabled": APM_ENABLED, "host": host}
 
 
 # ---------------------------------------------------------------------
@@ -348,7 +364,7 @@ async def generate(request: GenerateRequest):
         "top_up": request.profile.top_up,
         "domain": domain_value, "subdomain": subdomain_value, "geography": raw_geography,
         "resolved_geography": next((r.resolved_geography for r in results if r.resolved_geography), None),
-        "catalog_version": request.profile.catalog_version, "mode": request.profile.mode, "seed": request.profile.seed,
+        "catalog_version": request.profile.catalog_version,
         "target_id": request.profile.target_id, "target_name": request.profile.target_name,
         "row_count": request.row_count,
         "duration_seconds": round(time.monotonic() - started, 1),

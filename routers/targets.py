@@ -20,21 +20,3 @@ async def remove_target(target_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="Target not found")
     return {"ok": True}
-
-
-@router.get("/GetEndpoints")
-async def get_endpoints(target_id: str | None = None):
-    return await targets_service.list_endpoints(target_id)
-
-
-@router.post("/SaveEndpoint")
-async def save_endpoint(body: dict):
-    return await targets_service.upsert_endpoint(body)
-
-
-@router.delete("/DeleteEndpoint/{endpoint_id}")
-async def remove_endpoint(endpoint_id: str):
-    ok = await targets_service.delete_endpoint(endpoint_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail="Endpoint not found")
-    return {"ok": True}

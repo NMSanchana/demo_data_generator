@@ -2,12 +2,12 @@
 Shared asyncpg connection pool for the DEMO DATA platform store.
 All service modules import get_pool() from here -- never create their own connection.
 
-Environment variables (set in .env):
-    PG_HOST      default: 217.217.249.121
+Environment variables (set in .env -- see .env.example). There are no built-in credentials:
+    PG_HOST      required
+    PG_USER      required
+    PG_PASSWORD  required
     PG_PORT      default: 5432
     PG_DB        default: DEMO_DATA
-    PG_USER      default: gbuser
-    PG_PASSWORD  default: aidev123
 """
 
 import asyncpg
@@ -33,12 +33,15 @@ async def _init_connection(conn):
 def connection_kwargs(database: str | None = None) -> dict:
     """Connection settings for the shared PG server. database=None -> the main platform DB (PG_DB).
     Per-profile databases live on the same server with the same credentials (see service/profile_db.py)."""
+    missing = [k for k in ("PG_HOST", "PG_USER", "PG_PASSWORD") if not os.getenv(k)]
+    if missing:
+        raise RuntimeError(f"{', '.join(missing)} must be set in .env (see .env.example).")
     return dict(
-        host=os.getenv("PG_HOST", "217.217.249.121"),
+        host=os.getenv("PG_HOST"),
         port=int(os.getenv("PG_PORT", "5432")),
         database=database or os.getenv("PG_DB", "DEMO_DATA"),
-        user=os.getenv("PG_USER", "gbuser"),
-        password=os.getenv("PG_PASSWORD", "aidev123"),
+        user=os.getenv("PG_USER"),
+        password=os.getenv("PG_PASSWORD"),
     )
 
 
@@ -50,7 +53,7 @@ async def init_pool() -> None:
         max_size=10,
         init=_init_connection,
     )
-    logger.info("PostgreSQL pool initialised → %s/%s", os.getenv("PG_HOST", "217.217.249.121"), os.getenv("PG_DB", "DEMO_DATA"))
+    logger.info("PostgreSQL pool initialised → %s/%s", os.getenv("PG_HOST"), os.getenv("PG_DB", "DEMO_DATA"))
 
 
 async def close_pool() -> None:

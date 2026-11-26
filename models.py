@@ -37,22 +37,10 @@ class ProfileMeta(BaseModel):
     catalog_version: str | None = None
     target_id:       str | None = None
     target_name:     str | None = None
-    mode:            str | None = Field(
-        None, description="'table' | 'api' | 'hybrid' as chosen in the frontend. "
-                           "'table' has no effect on the backend today -- there is "
-                           "no direct-DB-write path, only the APM save flow -- so "
-                           "'table' and 'api'/'hybrid' currently behave identically "
-                           "at generation time; the distinction only matters once a "
-                           "future save/push step is mode-aware."
-    )
-    seed:    str | None = None
     top_up:  bool = Field(
-        False, description="'Top up an existing dataset instead of regenerating', "
-                            "as chosen in the frontend. Carried through for "
-                            "provenance/logging only -- the backend has no "
-                            "existing-key-reuse logic yet, so this currently has "
-                            "no effect on generation. Needs its own design when "
-                            "that capability is built."
+        False, description="'Top up an existing dataset instead of regenerating'. "
+                            "The run is appended to the profile's current stored version "
+                            "instead of creating a new one (see service/run_store.py)."
     )
 
 
