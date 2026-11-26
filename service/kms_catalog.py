@@ -45,6 +45,8 @@ ROWS_BY_CATEGORY = {
     "configuration": 50,
     "setup": 50,
     "report": 0,
+    # Dashboards / graphs only display data held by other screens: nothing to generate.
+    "dashboard": 0,
 }
 DEFAULT_ROWS = 300
 
@@ -413,6 +415,23 @@ def build_relationships(field_points: list[dict], features_by_screen: dict[str, 
 # Features
 # ----------------------------------------------------------------------
 
+def _disambiguate_module_names(products: dict, features: list[dict]) -> None:
+    """Two KMS module codes can end up with the same display name (e.g. "ESS" twice). Keep them
+    distinguishable by appending the module code: "ESS (ess)" / "ESS (essportal)"."""
+    for prod in products.values():
+        by_name: dict[str, list[dict]] = {}
+        for m in prod["modules"].values():
+            by_name.setdefault(m["name"].strip().lower(), []).append(m)
+        for group in by_name.values():
+            if len(group) > 1:
+                for m in group:
+                    m["name"] = f"{m['name']} ({m['id'].split('::', 1)[-1]})"
+        names = {m["id"].split("::", 1)[-1]: m["name"] for m in prod["modules"].values()}
+        for f in features:
+            if f["functionalityId"].startswith(prod["id"] + "::") and f["moduleId"] in names:
+                f["moduleName"] = names[f["moduleId"]]
+
+
 def build_catalog(module_pts: list[dict], cap_pts: list[dict], feat_pts: list[dict]) -> dict:
     module_info = {(m.get("module") or "").lower(): m for m in module_pts}
     cap_info = {((c.get("module") or "").lower(), (c.get("capability") or "")): c for c in cap_pts}
@@ -479,6 +498,8 @@ def build_catalog(module_pts: list[dict], cap_pts: list[dict], feat_pts: list[di
             "migrationGaps": p.get("migration_gaps") or 0,
             "source": "kms_usage_feature",
         })
+
+    _disambiguate_module_names(products, features)
 
     product_list = []
     for prod in products.values():
@@ -670,19 +691,76 @@ def _is_system_field(name: str) -> bool:
     return n in _SYSTEM_EXACT or any(s in n for s in _SYSTEM_SUBSTRINGS)
 
 
+def _s(v: Any) -> str:
+    return v.strip() if isinstance(v, str) else ""
+
+
+def _int_or_none(v: Any) -> int | None:
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
 def _field_info(p: dict) -> dict:
+    """One FieldKnowledge payload -> the facts the generator needs.
+
+    KMS stores, per field: field.visibleOnScreen, field.order, field.label,
+    field.type{form,ui,backend,database}, field.maxLength{form,database}, field.allowedValues,
+    field.lookup{...} and field.database{column,storage,...}. Older/other shapes (a plain string
+    type, database.dataType) are still read.
+    """
     field = p.get("field") or {}
     db = field.get("database") or {}
     mand = field.get("mandatory") or {}
-    dtype = field.get("dataType") or field.get("type") or db.get("dataType") or db.get("type") or ""
+    ftype = field.get("type") if isinstance(field.get("type"), dict) else {}
+    maxlen = field.get("maxLength") if isinstance(field.get("maxLength"), dict) else {}
+    lookup = field.get("lookup") if isinstance(field.get("lookup"), dict) else {}
+
+    allowed: list = []
+    for v in (field.get("allowedValues") if isinstance(field.get("allowedValues"), list) else []):
+        if isinstance(v, dict):
+            v = v.get("label") or v.get("value") or v.get("name")
+        if isinstance(v, (str, int, float)) and not isinstance(v, bool):
+            allowed.append(v)
+
+    legacy = field.get("dataType") or db.get("dataType") or db.get("type") \
+        or (field.get("type") if isinstance(field.get("type"), str) else "")
+    db_type = _s(ftype.get("database")) or _s(db.get("dataType"))
+    dtype = db_type or _s(ftype.get("backend")) or _s(ftype.get("form")) \
+        or (str(legacy) if isinstance(legacy, (str, int, float)) else "")
+    ml = _int_or_none(maxlen.get("form"))
+    if ml is None:
+        ml = _int_or_none(maxlen.get("database"))
+    visible = field.get("visibleOnScreen")
+
     return {
         "name": str(p.get("field_name") or "").strip(),
+        "label": _s(field.get("label")) or _s(p.get("field_label")),
+        "order": _int_or_none(field.get("order")),
+        "visible": visible if isinstance(visible, bool) else None,
+        "storage": _s(db.get("storage")),
+        "ui": _s(ftype.get("ui")),
+        "typeForm": _s(ftype.get("form")),
+        "typeBackend": _s(ftype.get("backend")),
+        "typeDb": db_type,
+        "maxLength": ml,
+        "allowedValues": allowed[:30],
+        "lookupSource": _s(lookup.get("source")) or _s(lookup.get("picklist")),
         "table": _norm_table(db.get("table")),
         "column": str(db.get("column") or ""),
         "primaryKey": db.get("primaryKey") is True,
         "required": bool(mand.get("required") or db.get("nullable") is False),
-        "dataType": str(dtype).lower() if isinstance(dtype, (str, int, float)) else "",
+        "dataType": dtype.lower(),
     }
+
+
+def _field_mode() -> str:
+    """KMS_FIELD_MODE=visible (default): keep only fields shown on the screen's header form.
+    KMS_FIELD_MODE=legacy: old behaviour (drop audit columns and other-table columns only)."""
+    return (os.getenv("KMS_FIELD_MODE") or "visible").strip().lower()
+
+
+def _is_grid_field(i: dict) -> bool:
+    """Grid / detail-row fields cannot be one value in a flat header row."""
+    return "grid" in i["ui"].lower() or "child table" in i["storage"].lower()
 
 
 def select_screen_fields(points: list[dict]) -> dict:
@@ -701,26 +779,48 @@ def select_screen_fields(points: list[dict]) -> dict:
         else:
             candidates.append(i)
 
-    counts: dict[str, int] = {}
-    for i in candidates:
-        if i["primaryKey"] and i["table"]:
-            counts[i["table"]] = counts.get(i["table"], 0) + 1
-    main_table = max(counts, key=counts.get) if counts else None
+    def drop_others(keep: list[dict], reason: str) -> None:
+        ids = {id(i) for i in keep}
+        dropped.extend({"name": i["name"], "reason": reason} for i in candidates if id(i) not in ids)
 
+    main_table: str | None = None
+    basis = "all fields"
     kept = candidates
-    if main_table:
-        on_main = [i for i in candidates if not i["table"] or i["table"] == main_table]
-        if len(on_main) >= 2:
-            kept = on_main
-            dropped += [{"name": i["name"], "reason": f"belongs to {i['table']} (grid / joined table), not {main_table}"}
-                        for i in candidates if i not in on_main]
-    if len(kept) < 2 and len(candidates) >= 2:
-        kept = candidates
 
-    # mandatory fields first, then primary keys, then the rest, each in stored order
-    order = {id(i): n for n, i in enumerate(kept)}
-    kept = sorted(kept, key=lambda i: (not i["required"], not i["primaryKey"], order[id(i)]))
-    return {"fields": kept, "dropped": dropped, "mainTable": main_table, "totalInKms": len(infos)}
+    if _field_mode() != "legacy":
+        # 1) grid / child-table fields are not part of the header row
+        no_grid = [i for i in candidates if not _is_grid_field(i)]
+        if len(no_grid) >= 2 and len(no_grid) < len(candidates):
+            drop_others(no_grid, "grid / child-table (detail rows), not part of the header row")
+            candidates = no_grid
+            kept = candidates
+        # 2) KMS says which fields are actually shown on the screen
+        visible = [i for i in candidates if i["visible"] is True]
+        if len(visible) >= 2:
+            if len(visible) < len(candidates):
+                drop_others(visible, "not visible on the screen (hidden / internal ID / system field)")
+            kept, basis = visible, "visibleOnScreen"
+
+    if basis == "all fields":
+        # No usable visibility data: fall back to the screen's main table.
+        counts: dict[str, int] = {}
+        for i in candidates:
+            if i["primaryKey"] and i["table"]:
+                counts[i["table"]] = counts.get(i["table"], 0) + 1
+        main_table = max(counts, key=counts.get) if counts else None
+        if main_table:
+            on_main = [i for i in candidates if not i["table"] or i["table"] == main_table]
+            if len(on_main) >= 2:
+                kept, basis = on_main, f"main table {main_table}"
+                drop_others(on_main, f"belongs to another table (grid / joined table), not {main_table}")
+        if len(kept) < 2 and len(candidates) >= 2:
+            kept = candidates
+
+    # mandatory fields first, then primary keys, then the rest in the screen's own field order
+    pos = {id(i): n for n, i in enumerate(kept)}
+    kept = sorted(kept, key=lambda i: (not i["required"], not i["primaryKey"],
+                                       i["order"] if i["order"] is not None else 10**6, pos[id(i)]))
+    return {"fields": kept, "dropped": dropped, "mainTable": main_table, "basis": basis, "totalInKms": len(infos)}
 
 
 _fields_cache: dict[str, tuple[float, dict]] = {}
@@ -738,7 +838,7 @@ async def get_screen_fields(screen_id: str) -> dict:
         {"key": "screen_id", "match": {"value": screen_id}},
     ]}
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-        pts = await _scroll(client, flt, ["screen_id", "field_name", "field"])
+        pts = await _scroll(client, flt, ["screen_id", "field_name", "field_label", "field"])
     result = select_screen_fields(pts)
     _fields_cache[key] = (time.time(), result)
     return result

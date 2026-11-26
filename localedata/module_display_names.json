@@ -1,0 +1,4 @@
+{
+  "_comment": "Optional readable names for KMS module codes that only have a raw code as their name. Format: \"<kms module code>\": \"<name to show in the tree>\". Keys starting with _ are ignored. Restart the backend after editing. Built-in names (Attendance & Payroll, Competency Management, Dealer Portal, GB Service Desk, SQL Workbench) already exist in service/module_names.py.",
+  "_example": "Some Code Here"
+}

@@ -51,6 +51,15 @@ You will be given:
 - fields: the already-extracted form fields for this screen (field_name,
   kind, selector) — produced by a separate, deterministic extraction step.
   Do NOT re-extract fields from HTML; use exactly this list.
+  A field may also carry these optional hints. Respect every one that is present:
+  - label: the caption shown on the screen (e.g. "Reservation (%)"). Use it to
+    understand what the value means; the row key is still field_name.
+  - data_type: the real type (e.g. "percentage", "number", "string (nvarchar(35))").
+    A number/percentage field must be a real JSON number, never text. A percentage
+    is a plain number such as 12.5 (no % sign).
+  - max_length: the value must never be longer than this many characters.
+  - allowed_values: a closed list. Use ONLY values from it, written exactly.
+  - required: true means the value must never be empty.
 
 Your job — generate rows only:
 

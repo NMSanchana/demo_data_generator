@@ -119,14 +119,49 @@ def apm_module_name(text: object) -> str:
     return m["entry"]["module"] if m["entry"] else clean_module_code(text)
 
 
+# KMS sometimes only has the raw module code ("Attendanceandpayroll"). These are readable names
+# for such codes. More can be added without code in localedata/module_display_names.json
+# ({"<kms module code>": "<name to show>"}, keys starting with "_" are ignored).
+_BUILTIN_DISPLAY_NAMES = {
+    "attendanceandpayroll": "Attendance & Payroll",
+    "competencymanagement": "Competency Management",
+    "dealerportal": "Dealer Portal",
+    "gbservicedesk": "GB Service Desk",
+    "sqlworkbench": "SQL Workbench",
+}
+_DISPLAY_FILE = Path(__file__).resolve().parent.parent / "localedata" / "module_display_names.json"
+_display_cache: dict[str, str] | None = None
+
+
+def _display_overrides() -> dict[str, str]:
+    global _display_cache
+    if _display_cache is None:
+        data = dict(_BUILTIN_DISPLAY_NAMES)
+        path = Path(os.getenv("KMS_MODULE_NAMES_FILE") or _DISPLAY_FILE)
+        try:
+            if path.exists():
+                raw = json.loads(path.read_text(encoding="utf-8") or "{}")
+                data.update({_norm(k): str(v).strip() for k, v in raw.items()
+                             if not str(k).startswith("_") and str(v).strip()})
+        except Exception as e:  # a broken names file must never break the catalog
+            logger.warning("module_names: could not read %s (%s)", path, e)
+        _display_cache = data
+    return _display_cache
+
+
 def display_name(code: str, functionality: object) -> tuple[str, list[str]]:
     """(name for the catalog tree, list of functional areas it covers).
 
     A single value is used as is. A combined value ("Administration, ESS, Framework, Projects")
     is a list of areas, not a name: the tree shows a short name (canonical APM name if the code
     maps to one, else the title-cased code) and the areas go to the description.
+    A readable-name override for the code (see _BUILTIN_DISPLAY_NAMES) wins over both.
     """
     parts = split_parts(functionality)
+    overrides = _display_overrides()
+    override = overrides.get(_norm(code)) or (overrides.get(_norm(parts[0])) if len(parts) == 1 else None)
+    if override:
+        return override, (parts if len(parts) > 1 else [])
     if len(parts) == 1:
         return parts[0], []
     if len(parts) > 1:

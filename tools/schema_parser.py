@@ -151,8 +151,39 @@ def _classify_by_name(field_name: str, data_type: str = "") -> str:
     return "input"
 
 
-def _record(name: str, kind: str, required: bool = False) -> dict:
-    return {
+_NUMERIC_TOKENS = {
+    "number", "percentage", "decimal", "numeric", "int", "integer", "smallint", "tinyint", "bigint",
+    "byte", "double", "float", "money", "currency", "amount",
+}
+
+
+def _classify_with_meta(name: str, info: dict) -> str:
+    """Kind from the field's real KMS type metadata first, then the name heuristic.
+
+    The name alone misleads: "ReservationPercentage" contains "category" in its screen prefix
+    (CasteCategory...) and would become a picklist, but KMS says it is a percentage."""
+    base = _classify_by_name(name, info.get("dataType", ""))
+    types = " ".join(str(info.get(k) or "") for k in ("typeForm", "typeBackend", "typeDb")).lower()
+    toks = set(re.findall(r"[a-z]+", types))
+    ui = str(info.get("ui") or "").lower()
+
+    if info.get("allowedValues") and base not in ("identifier", "name"):
+        return "picklist"
+    if toks & {"bool", "boolean", "bit"}:
+        return "checkbox"
+    if base in ("identifier", "name"):
+        return base
+    if "date" in types:
+        return "date"
+    if "lookup" in ui:
+        return "picklist"
+    if toks & _NUMERIC_TOKENS:
+        return "input"
+    return base
+
+
+def _record(name: str, kind: str, required: bool = False, extra: dict | None = None) -> dict:
+    rec = {
         "field_name": name,
         "kind": kind,
         "selector": f"formControlName={name}",
@@ -160,20 +191,38 @@ def _record(name: str, kind: str, required: bool = False) -> dict:
         "source_tag": "kms",
         "required": required,
     }
+    if extra:
+        rec.update({k: v for k, v in extra.items() if v not in (None, "", [], {})})
+    return rec
+
+
+def _meta_extra(it: dict) -> dict:
+    """Context for the generator (it reads the whole field record): on-screen label, a readable
+    type, the length limit and the closed list of allowed values, when KMS has them."""
+    form, db = str(it.get("typeForm") or ""), str(it.get("typeDb") or "")
+    data_type = form if not db or db.lower() == form.lower() else (f"{form} ({db})" if form else db)
+    label = str(it.get("label") or "")
+    return {
+        "label": label,
+        "data_type": data_type,
+        "max_length": it.get("maxLength"),
+        "allowed_values": it.get("allowedValues"),
+    }
 
 
 def classify_fields(infos: list) -> list[dict]:
     """Builds schema_extraction-shaped field records from KMS field info.
     Each item is either a plain name string or a dict {name, required, dataType, ...}
     (see kms_catalog.select_screen_fields). Downstream code (Agents/data_generator_agent.py)
-    reads field_name and kind; `required` is extra context for the generator."""
+    reads field_name and kind; `required`, `label`, `data_type`, `max_length` and
+    `allowed_values` are extra context for the generator."""
     fields: list[dict] = []
     for it in infos:
         if isinstance(it, str):
-            name, required, dtype = it, False, ""
-        else:
-            name, required, dtype = it["name"], bool(it.get("required")), it.get("dataType", "")
-        fields.append(_record(name, _classify_by_name(name, dtype), required))
+            fields.append(_record(it, _classify_by_name(it, ""), False))
+            continue
+        name = it["name"]
+        fields.append(_record(name, _classify_with_meta(name, it), bool(it.get("required")), _meta_extra(it)))
     return fields
 
 

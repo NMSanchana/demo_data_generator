@@ -44,7 +44,7 @@ async def kms_screen_fields(screen_id: str, detail: bool = False):
     names = [f["name"] for f in info["fields"]]
     if not detail:
         return {"screen": hit, "fields": names}
-    return {"screen": hit, "fields": names, "mainTable": info["mainTable"],
+    return {"screen": hit, "fields": names, "basis": info.get("basis"), "mainTable": info["mainTable"],
             "totalInKms": info["totalInKms"], "kept": info["fields"], "dropped": info["dropped"]}
 
 
