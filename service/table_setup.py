@@ -49,6 +49,22 @@ CREATE TABLE IF NOT EXISTS ddpa_targets (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Custom dimensions added by people (the built-in ones stay in the frontend seed)
+CREATE TABLE IF NOT EXISTS ddpa_dimensions (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL UNIQUE,
+    description   TEXT NOT NULL DEFAULT '',
+    precedence    DOUBLE PRECISION NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Priority order of ALL dimensions (built-in and custom). Higher number = wins when dimensions disagree.
+CREATE TABLE IF NOT EXISTS ddpa_dimension_order (
+    id            TEXT PRIMARY KEY,
+    precedence    DOUBLE PRECISION NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Dimension values (dimension structure stays in seed; values are user-managed)
 CREATE TABLE IF NOT EXISTS ddpa_dimension_values (
     id            TEXT PRIMARY KEY,
