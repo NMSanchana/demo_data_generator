@@ -178,9 +178,10 @@ async def _profile_pool(profile_id: str):
     return await profile_db.get_profile_pool(profile.get("db_name") or profile_db.db_name_for(profile_id))
 
 
-async def stored_screen_versions(profile_id: str) -> dict[str, int]:
-    """{SCREEN_ID (upper-case): version_no} for every screen that already has rows in the profile's CURRENT version.
-    Used by relationship-based generation to reuse parent data instead of generating it again. Never raises."""
+async def stored_screen_info(profile_id: str) -> dict[str, dict]:
+    """{SCREEN_ID (upper-case): {"version_no", "row_count"}} for every screen that already has rows in the profile's
+    CURRENT version. Used by relationship-based generation to reuse parent data instead of generating it again,
+    and by the "Checks before you generate" list to say how many rows will be reused. Never raises."""
     try:
         pool = await _profile_pool(profile_id)
         if pool is None:
@@ -188,20 +189,25 @@ async def stored_screen_versions(profile_id: str) -> dict[str, int]:
         async with pool.acquire() as conn:
             found = await conn.fetch(
                 """
-                SELECT UPPER(s.screen_id) AS sid, r.version_no
+                SELECT UPPER(s.screen_id) AS sid, r.version_no, s.row_count
                 FROM dd_run_screens s JOIN dd_runs r ON r.id = s.run_id
                 WHERE r.is_current AND s.status = 'ok' AND s.row_count > 0 AND s.screen_id IS NOT NULL
                 """
             )
-        return {r["sid"]: r["version_no"] for r in found}
+        return {r["sid"]: {"version_no": r["version_no"], "row_count": int(r["row_count"] or 0)} for r in found}
     except Exception:  # noqa: BLE001
         logger.exception("run_store: could not read stored screens for profile %s", profile_id)
         return {}
 
 
+async def stored_screen_versions(profile_id: str) -> dict[str, int]:
+    """{SCREEN_ID (upper-case): version_no} -- the version part of stored_screen_info(). Never raises."""
+    return {sid: info["version_no"] for sid, info in (await stored_screen_info(profile_id)).items()}
+
+
 async def stored_screen_data(profile_id: str, screen_ids: list[str], max_rows: int = 200) -> dict[str, dict]:
-    """{SCREEN_ID (upper-case): {"name", "fields", "rows", "version_no"}} from the profile's CURRENT version,
-    for the given screens (at most max_rows rows each). Never raises."""
+    """{SCREEN_ID (upper-case): {"name", "fields", "rows", "version_no", plus the screen's stored details}} from the
+    profile's CURRENT version, for the given screens (at most max_rows rows each). Never raises."""
     out: dict[str, dict] = {}
     ids = sorted({str(i).upper() for i in screen_ids if i})
     if not ids:
@@ -213,7 +219,8 @@ async def stored_screen_data(profile_id: str, screen_ids: list[str], max_rows: i
         async with pool.acquire() as conn:
             screens = await conn.fetch(
                 """
-                SELECT s.id, UPPER(s.screen_id) AS sid, s.screen, s.fields, r.version_no
+                SELECT s.id, UPPER(s.screen_id) AS sid, s.screen_id, s.screen, s.fields, s.feature_id, s.feature_name,
+                       s.data_template, s.module, s.kms_module, s.resolved_via, s.fields_source, s.apm_ready, r.version_no
                 FROM dd_run_screens s JOIN dd_runs r ON r.id = s.run_id
                 WHERE r.is_current AND s.status = 'ok' AND s.row_count > 0 AND UPPER(s.screen_id) = ANY($1::text[])
                 """,
@@ -228,6 +235,9 @@ async def stored_screen_data(profile_id: str, screen_ids: list[str], max_rows: i
                     "fields": _as_json(s["fields"]) or [],
                     "rows": [_as_json(r["data"]) for r in rows],
                     "version_no": s["version_no"],
+                    "screen_id": s["screen_id"], "feature_id": s["feature_id"], "feature_name": s["feature_name"],
+                    "data_template": s["data_template"], "module": s["module"], "kms_module": s["kms_module"],
+                    "resolved_via": s["resolved_via"], "fields_source": s["fields_source"], "apm_ready": bool(s["apm_ready"]),
                 }
     except Exception:  # noqa: BLE001
         logger.exception("run_store: could not read stored rows for profile %s", profile_id)

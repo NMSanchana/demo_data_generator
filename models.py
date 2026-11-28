@@ -133,6 +133,8 @@ class ScreenResult(BaseModel):
     relationship_notes:     list[str] = Field(
         default_factory=list, description="Plain-language notes on how this screen used (or could not use) its parent screens' data"
     )
+    reused:                 bool = Field(False, description="True when this screen was not generated: its rows were already in the profile database and were reused")
+    reused_from_version:    int | None = Field(None, description="The stored version the reused rows came from")
 
 
 class StorageInfo(BaseModel):
@@ -158,6 +160,46 @@ class GenerateResponse(BaseModel):
     results:    list[ScreenResult] = []
     storage:    StorageInfo | None = None
     logs:       list[LogEntry] = Field(default_factory=list, description="The readable log of this run, grouped by screen in the UI")
+
+
+# ---------------------------------------------------------------------
+# /generate runs as a background job: start it, then poll its progress
+# ---------------------------------------------------------------------
+
+class GenerateStartResponse(BaseModel):
+    job_id: str
+
+
+class JobScreen(BaseModel):
+    """One screen of a run and where it stands."""
+    key:        int
+    screen:     str
+    screen_id:  str | None = None
+    feature_name: str | None = None
+    status:     Literal["waiting", "generating", "done", "reused", "failed"]
+    row_count:  int = 0
+    message:    str | None = Field(None, description="Why the screen failed (status 'failed')")
+    auto_added: bool = False
+    auto_added_for: list[str] = Field(default_factory=list)
+    reused_from_version: int | None = None
+    result_index: int | None = Field(None, description="Position of this screen's full result in the results list, once it has finished")
+    seconds:    float | None = Field(None, description="How long this screen took to generate")
+
+
+class JobStatusResponse(BaseModel):
+    job_id:     str
+    profile_id: str
+    status:     Literal["preparing", "running", "completed", "failed"]
+    error:      str | None = None
+    elapsed:    float = 0
+    screens:    list[JobScreen] = []
+    done:       int = Field(0, description="Screens finished so far (generated, reused or failed)")
+    total:      int = Field(0, description="Screens in the run (0 while the run is still being prepared)")
+    logs:       list[LogEntry] = Field(default_factory=list, description="Log lines from log_from on")
+    log_next:   int = Field(0, description="Pass this as log_from on the next poll")
+    results:    list[ScreenResult] = Field(default_factory=list, description="Finished screens (with rows) from result_from on")
+    result_next: int = Field(0, description="Pass this as result_from on the next poll")
+    storage:    StorageInfo | None = None
 
 
 class SaveRowRequest(BaseModel):
@@ -222,10 +264,13 @@ class PlannedScreen(BaseModel):
     screen_id: str
     name:      str
     auto_added: bool = False
+    rows:      int | None = Field(None, description="For a reused screen: how many rows are already stored")
+    version:   int | None = Field(None, description="For a reused screen: the stored version the rows are in")
 
 
 class PlanResponse(BaseModel):
     notices:  list[PlanNotice] = []
     order:    list[PlannedScreen] = Field(default_factory=list, description="Every screen of the run, parents first")
     auto_added: list[PlannedScreen] = []
+    reused:   list[PlannedScreen] = Field(default_factory=list, description="Related screens whose data is already in the profile database and will be reused")
     unresolved: list[str] = Field(default_factory=list, description="Requested screens KMS does not know (they cannot be planned)")

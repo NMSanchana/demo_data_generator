@@ -9,8 +9,8 @@ from dotenv import load_dotenv
 
 from models import (
     GenerateRequest,
-    GenerateResponse,
-    LogEntry,
+    GenerateStartResponse,
+    JobStatusResponse,
     PlanNotice,
     PlanRequest,
     PlanResponse,
@@ -26,7 +26,7 @@ from service.apm_client import execute_save
 from service.apm_session import parse_login, login_warnings
 from service import feature_resolver, relationship_planner
 from service.postgres_client import init_pool, close_pool
-from service import profile_db, run_store, kms_catalog
+from service import profile_db, run_store, kms_catalog, job_store
 from service.run_log import RunLog, plain_error
 from Agents import architecture_agent
 from Agents.apm_resolver_agent import resolve_apm_schema
@@ -272,16 +272,18 @@ async def _plan_relationships(request: GenerateRequest, screen_contexts: list[di
     """
     Phase 1b. Works out how the selected screens relate (service/relationship_planner.py):
       - parents that are missing from the run are resolved and added (unless auto_add_parents is off);
-      - parents that already have data in the profile's current version are reused instead;
+      - parents that already have data in the profile's current version are reused instead (always, when available);
       - the screens are ordered parents first.
     Never fails the request: on any problem the screens simply run in the order given, as before.
     """
-    info = {"contexts": screen_contexts, "plan": None, "stored": {}}
+    info = {"contexts": screen_contexts, "plan": None, "stored": {}, "stored_rows": {}}
     try:
         ok_ids = [c["screen_id"] for c in screen_contexts if c["ok"] and c.get("screen_id")]
         if not ok_ids:
             return info
-        stored = await run_store.stored_screen_versions(request.profile.id)
+        stored_info = await run_store.stored_screen_info(request.profile.id)
+        stored = {sid: v["version_no"] for sid, v in stored_info.items()}
+        stored_rows = {sid: v["row_count"] for sid, v in stored_info.items()}
         plan = await relationship_planner.build_plan(ok_ids, auto_add=request.auto_add_parents, stored=stored)
 
         # resolve and add the missing parent screens
@@ -306,14 +308,49 @@ async def _plan_relationships(request: GenerateRequest, screen_contexts: list[di
         # parents first (screens without a screen id, i.e. failed ones, keep their place at the end)
         position = {sid: i for i, sid in enumerate(plan["order"])}
         screen_contexts = sorted(screen_contexts, key=lambda c: position.get(_up(c.get("screen_id")), len(position)))
-        info.update({"contexts": screen_contexts, "plan": plan, "stored": stored})
+        info.update({"contexts": screen_contexts, "plan": plan, "stored": stored, "stored_rows": stored_rows})
     except Exception:  # noqa: BLE001
         logger.exception("generate: relationship planning failed -- generating screens independently")
     return info
 
 
-@app.post("/generate", response_model=GenerateResponse)
-async def generate(request: GenerateRequest):
+# Reused parent rows are copied into the new version so every version stays complete.
+MAX_REUSED_ROWS = 1000
+
+
+class JobFailed(Exception):
+    """The run cannot continue; the message is shown on the page."""
+
+
+def _error_result(ctx: dict, message: str) -> ScreenResult:
+    feat = ctx["feature"]
+    return ScreenResult(
+        status="error", message=message,
+        feature_id=feat.id, feature_name=feat.name, data_template=ctx["data_template"],
+        screen=ctx["screen_name"], screen_id=ctx.get("screen_id"),
+        auto_added=bool(ctx.get("auto_added")), auto_added_for=ctx.get("auto_added_for") or [],
+    )
+
+
+def _reused_result(screen_id: str, data: dict) -> ScreenResult:
+    """A parent screen that was not generated: its rows come from the profile's current stored version."""
+    version = data.get("version_no")
+    rows = data.get("rows") or []
+    return ScreenResult(
+        status="ok", message=f"Reused from v{version}",
+        feature_id=data.get("feature_id"), feature_name=data.get("feature_name") or data.get("name"),
+        data_template=data.get("data_template"), resolved_via=data.get("resolved_via"), fields_source=data.get("fields_source"),
+        screen=data.get("name") or screen_id, module=data.get("module"), kms_module=data.get("kms_module"),
+        screen_id=data.get("screen_id") or screen_id,
+        fields=data.get("fields") or [], rows=rows, row_count=len(rows),
+        apm_ready=bool(data.get("apm_ready")),
+        reused=True, reused_from_version=version,
+        relationship_notes=[f"Reused from v{version} ({len(rows)} row(s) already in your database); not generated again."],
+    )
+
+
+async def _generate_job(job: job_store.Job, request: GenerateRequest) -> None:
+    """The whole Generate run. Updates `job` as it goes so the page can show progress."""
     started = time.monotonic()  # real generation time, stored with the version
     domain_value = request.domain
     subdomain_value = request.subdomain or None
@@ -323,11 +360,11 @@ async def generate(request: GenerateRequest):
     raw_geography = request.geography
 
     logger.info(
-        "generate: profile=%s mode=%s screens requested=%d",
-        request.profile.id, request.profile.mode, sum(len(f.data_templates) for f in request.features),
+        "generate: profile=%s mode=%s screens requested=%d job=%s",
+        request.profile.id, request.profile.mode, sum(len(f.data_templates) for f in request.features), job.id,
     )
 
-    log = RunLog()
+    log = job.log
     mode_label = {"full": "Full", "partial": "Partial", "add": "Add to existing"}.get(request.profile.mode or "", "Partial")
     n_requested = sum(len(f.data_templates) for f in request.features)
     log.info(
@@ -340,6 +377,8 @@ async def generate(request: GenerateRequest):
     if not APM_ENABLED:
         log.info("APM is switched off (APM_ENABLED=false): rows are previews and cannot be pushed.")
 
+    job.set_phase("preparing")
+    log.info("Resolving the screens and checking which related screens are needed.")
     resolved = await _resolve_feature_screens(request.features)
 
     screen_contexts = await _build_contexts(resolved)
@@ -365,18 +404,64 @@ async def generate(request: GenerateRequest):
         if c.get("auto_added"):
             who = ", ".join(c.get("auto_added_for") or []) or "another screen"
             log.info(f"Added automatically because {who} needs it; generated before it.", name)
-    plan_info = rel["plan"]
-    if plan_info:
-        reused = [l for l in plan_info["links"] if l["status"] == "reused"]
-        for parent in sorted({l["parent"] for l in reused}):
-            log.info(f"Reusing {plan_info['names'].get(parent, parent)} from v{rel['stored'].get(parent, '?')} (already stored); not generated again.")
-        log.info("Generation order (parents first): " + " \u2192 ".join(plan_info["names"].get(s, s) for s in plan_info["order"]) + ".")
+
+    plan = rel["plan"]
+
+    # Parent data already in the profile database is reused (always, when available): load it now.
+    sources: dict[str, dict] = {}
+    owners: dict[str, str] = {}
+    reused_results: list[ScreenResult] = []
+    if plan:
+        try:
+            owners = await relationship_planner.table_owners()
+            reused_ids = sorted({l["parent"] for l in plan["links"] if l["status"] == "reused"})
+            stored_data = await run_store.stored_screen_data(request.profile.id, reused_ids, max_rows=MAX_REUSED_ROWS)
+            sources.update(stored_data)
+            for sid in reused_ids:
+                data = stored_data.get(sid)
+                if data is None:
+                    log.warning(f"{plan['names'].get(sid, sid)} was expected in the stored data but could not be read; screens that need it get invented values.")
+                    continue
+                rr = _reused_result(sid, data)
+                reused_results.append(rr)
+                log.info(f"Reusing {rr.screen}: {rr.row_count} row(s) already in your database (v{rr.reused_from_version}); not generated again.", rr.screen)
+        except Exception:  # noqa: BLE001
+            logger.exception("generate: could not load parent data -- screens will not be linked")
+            log.warning("Parent data already in the database could not be read; screens that need it get invented values.")
+
+    if plan:
+        log.info("Generation order (parents first): " + " \u2192 ".join(plan["names"].get(s, s) for s in plan["order"]) + ".")
     elif any(c["ok"] for c in screen_contexts):
         log.warning("Related screens could not be worked out; screens are generated independently, in the order given.")
 
+    # Publish the list of screens to the page: reused parents first, then the rest in generation order
+    results_by_key: dict[int, ScreenResult] = {}
+    for rr in reused_results:
+        key = job.add_screen(
+            screen=rr.screen, status="reused", screen_id=rr.screen_id, feature_name=rr.feature_name,
+            row_count=rr.row_count, reused_from_version=rr.reused_from_version,
+        )
+        results_by_key[key] = rr
+        job.add_result(key, rr.model_dump())
+    for ctx in screen_contexts:
+        if ctx["ok"]:
+            ctx["_key"] = job.add_screen(
+                screen=ctx["screen_name"], status="waiting", screen_id=ctx.get("screen_id"), feature_name=ctx["feature"].name,
+                auto_added=bool(ctx.get("auto_added")), auto_added_for=ctx.get("auto_added_for") or [],
+            )
+        else:
+            msg = plain_error(ctx["error"])
+            key = job.add_screen(
+                screen=ctx["screen_name"], status="failed", screen_id=ctx.get("screen_id"), feature_name=ctx["feature"].name, message=msg,
+            )
+            er = _error_result(ctx, msg)
+            results_by_key[key] = er
+            job.add_result(key, er.model_dump())
+            ctx["_key"] = key
+
     if not any(c["ok"] for c in screen_contexts):
         first_error = next((c["error"] for c in screen_contexts if not c["ok"]), "Generation failed.")
-        raise HTTPException(status_code=422, detail=first_error)
+        raise JobFailed(plain_error(first_error))
 
     # Phase 2: entity-assignment consistency, grouped per resolved module
     # (same picklist-consistency goal as before -- a feature's picklists
@@ -409,30 +494,20 @@ async def generate(request: GenerateRequest):
     # within one module) reuses that resolved value.
     geography_for_next_screen = raw_geography
     geography_resolved_yet = False
+    job.set_phase("running")
 
-    # Relationship-based generation: rows of screens finished so far (and parent data reused from the stored
-    # version) are the only allowed values for the child fields that point at them.
-    plan = rel["plan"]
-    sources: dict[str, dict] = {}
-    owners: dict[str, str] = {}
-    if plan:
-        try:
-            owners = await relationship_planner.table_owners()
-            reused_ids = [l["parent"] for l in plan["links"] if l["status"] == "reused"]
-            sources.update(await run_store.stored_screen_data(request.profile.id, reused_ids))
-        except Exception:  # noqa: BLE001
-            logger.exception("generate: could not load parent data -- screens will not be linked")
+    def finish(key: int, result: ScreenResult, status: str, seconds: float | None = None) -> None:
+        results_by_key[key] = result
+        job.add_result(
+            key, result.model_dump(), status=status, row_count=result.row_count,
+            message=result.message if status == "failed" else None, seconds=seconds,
+        )
 
-    results: list[ScreenResult] = []
     for ctx in screen_contexts:
-        feat = ctx["feature"]
         if not ctx["ok"]:
-            results.append(ScreenResult(
-                status="error", message=plain_error(ctx["error"]),
-                feature_id=feat.id, feature_name=feat.name, data_template=ctx["data_template"],
-                screen=ctx["screen_name"],
-            ))
-            continue
+            continue  # already shown as failed above
+        feat = ctx["feature"]
+        key = ctx["_key"]
 
         apm_resolution = ctx["apm_resolution"]
         apm_ready = bool(apm_resolution.get("ok"))
@@ -445,6 +520,7 @@ async def generate(request: GenerateRequest):
 
         sname = ctx["screen_name"]
         want_rows = feat.row_count or request.row_count or 20
+        job.update_screen(key, status="generating")
         for n in notes:
             log.info(n, sname)
         log.info(f"Generating {want_rows} row(s)" + (f" using {len(parent_values)} linked field(s)" if parent_values else "") + ".", sname)
@@ -469,20 +545,12 @@ async def generate(request: GenerateRequest):
         except Exception as e:
             logger.exception("Generation pipeline crashed for feature=%r (%s/%s)", feat.id, ctx["module"], ctx["screen_name"])
             log.error(f"Generation failed: {plain_error(e)}", sname)
-            results.append(ScreenResult(
-                status="error", message=plain_error(e),
-                feature_id=feat.id, feature_name=feat.name, data_template=ctx["data_template"],
-                screen=ctx["screen_name"],
-            ))
+            finish(key, _error_result(ctx, plain_error(e)), "failed")
             continue
 
         if final_state.get("generation_error"):
             log.error(f"Generation failed: {plain_error(final_state['generation_error'])}", sname)
-            results.append(ScreenResult(
-                status="error", message=plain_error(final_state["generation_error"]),
-                feature_id=feat.id, feature_name=feat.name, data_template=ctx["data_template"],
-                screen=ctx["screen_name"],
-            ))
+            finish(key, _error_result(ctx, plain_error(final_state["generation_error"])), "failed")
             continue
 
         if final_state.get("resolved_geography"):
@@ -508,7 +576,7 @@ async def generate(request: GenerateRequest):
             log.info(f"{final_state['dedup_renamed']} duplicate identifier value(s) were renamed to keep them unique.", sname)
         if plan and ctx.get("screen_id"):
             sources[_up(ctx["screen_id"])] = {"name": ctx["screen_name"], "fields": ctx["fields"], "rows": rows}
-        results.append(ScreenResult(
+        finish(key, ScreenResult(
             status="ok",
             feature_id=feat.id, feature_name=feat.name, data_template=ctx["data_template"],
             resolved_via=ctx["resolved_via"],
@@ -529,9 +597,13 @@ async def generate(request: GenerateRequest):
             auto_added=bool(ctx.get("auto_added")),
             auto_added_for=ctx.get("auto_added_for") or [],
             relationship_notes=notes,
-        ))
+        ), "done", took)
 
     # Store this run as the next version in the profile's own database. Best effort: never fails the request.
+    # Screens in screens-list order (reused parents first). In "Add to existing" mode the reused parents are
+    # already in the current version, so they are not stored again.
+    results = [results_by_key[k] for k in sorted(results_by_key)]
+    to_store = [r for r in results if not (r.reused and request.profile.mode == "add")]
     meta = {
         "top_up": request.profile.top_up,
         "mode": request.profile.mode,
@@ -542,23 +614,64 @@ async def generate(request: GenerateRequest):
         "row_count": request.row_count,
         "duration_seconds": round(time.monotonic() - started, 1),
     }
-    ok_n = sum(1 for r in results if r.status == "ok")
-    total_rows = sum(r.row_count for r in results)
-    log.info(f"Finished: {ok_n} of {len(results)} screen(s) generated, {total_rows} row(s), in {meta['duration_seconds']}s. Storing in the profile database.")
+    generated = [r for r in results if r.status == "ok" and not r.reused]
+    reused_n = sum(1 for r in results if r.reused)
+    failed_n = sum(1 for r in results if r.status != "ok")
+    total_rows = sum(r.row_count for r in generated)
+    log.info(
+        f"Finished: {len(generated)} screen(s) generated" + (f", {reused_n} reused" if reused_n else "") + (f", {failed_n} failed" if failed_n else "")
+        + f", {total_rows} new row(s), in {meta['duration_seconds']}s. Storing in the profile database."
+    )
     meta["logs"] = list(log.entries)
-    storage = await run_store.save_run(request.profile.id, meta, results)
+    storage = await run_store.save_run(request.profile.id, meta, to_store)
     if storage.get("saved"):
         log.info(
             f"Stored as v{storage.get('version_no')}" + (" (rows added to the existing version)" if storage.get("appended") else "")
             + f" in database {storage.get('db_name')}: {storage.get('rows_saved')} row(s)."
+            + (" Reused parent rows were copied into it." if reused_n and not storage.get("appended") else "")
         )
     else:
         log.error(f"The rows were generated but NOT stored in the profile database: {storage.get('error') or 'no reason given'}")
 
-    return GenerateResponse(
-        profile_id=request.profile.id, results=results, storage=StorageInfo(**storage),
-        logs=[LogEntry(**e) for e in log.entries],
-    )
+    job.complete(storage)
+
+
+async def _run_job(job: job_store.Job, request: GenerateRequest) -> None:
+    """Background wrapper: whatever happens, the job ends as completed or failed (the page is polling for that)."""
+    try:
+        await _generate_job(job, request)
+    except JobFailed as e:
+        job.log.error(str(e))
+        job.fail(str(e))
+    except HTTPException as e:
+        job.log.error(str(e.detail))
+        job.fail(str(e.detail))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("generate: job %s crashed", job.id)
+        msg = plain_error(e)
+        job.log.error(f"The run stopped unexpectedly: {msg}")
+        job.fail(msg)
+
+
+@app.post("/generate", response_model=GenerateStartResponse)
+async def generate(request: GenerateRequest):
+    """Starts a run in the background and returns at once. Follow it with GET /generate/{job_id}."""
+    job = job_store.create_job(request.profile.id, request.profile.name)
+    job.task = asyncio.create_task(_run_job(job, request))
+    return GenerateStartResponse(job_id=job.id)
+
+
+@app.get("/generate/{job_id}", response_model=JobStatusResponse)
+async def generate_status(job_id: str, log_from: int = 0, result_from: int = 0):
+    """Progress of a run: the status of every screen, the log lines from log_from on and the finished screens
+    (with rows) from result_from on. Pass log_next / result_next from the previous answer to get only what is new."""
+    job = job_store.get_job(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="This run is no longer available (the backend may have restarted). Anything already stored is in the profile's versions.",
+        )
+    return JobStatusResponse(**job.snapshot(log_from, result_from))
 
 
 # ---------------------------------------------------------------------
@@ -581,14 +694,22 @@ async def plan_generation(request: PlanRequest):
     if not screen_ids:
         return PlanResponse(unresolved=unresolved)
 
-    stored = await run_store.stored_screen_versions(request.profile_id) if request.profile_id else {}
+    stored_info = await run_store.stored_screen_info(request.profile_id) if request.profile_id else {}
+    stored = {sid: v["version_no"] for sid, v in stored_info.items()}
+    stored_rows = {sid: v["row_count"] for sid, v in stored_info.items()}
     plan = await relationship_planner.build_plan(screen_ids, auto_add=request.auto_add_parents, stored=stored)
     added = set(plan["auto_add"])
     order = [PlannedScreen(screen_id=s, name=plan["names"].get(s, s), auto_added=s in added) for s in plan["order"]]
+    reused_ids = sorted({l["parent"] for l in plan["links"] if l["status"] == "reused"}, key=lambda s: plan["names"].get(s, s))
+    reused = [
+        PlannedScreen(screen_id=s, name=plan["names"].get(s, s), rows=stored_rows.get(s), version=stored.get(s))
+        for s in reused_ids
+    ]
     return PlanResponse(
-        notices=[PlanNotice(**n) for n in relationship_planner.describe_plan(plan, stored)],
+        notices=[PlanNotice(**n) for n in relationship_planner.describe_plan(plan, stored, stored_rows)],
         order=order,
         auto_added=[p for p in order if p.auto_added],
+        reused=reused,
         unresolved=unresolved,
     )
 

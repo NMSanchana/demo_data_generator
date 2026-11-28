@@ -185,9 +185,11 @@ def _list_names(names: list[str], limit: int = 3) -> str:
     return shown + (f" and {len(names) - limit} more" if len(names) > limit else "")
 
 
-def describe_plan(plan: dict, stored: dict[str, int] | None = None) -> list[dict]:
-    """Plain-language notices for the page, one per (parent, status) so a big run stays readable."""
+def describe_plan(plan: dict, stored: dict[str, int] | None = None, stored_rows: dict[str, int] | None = None) -> list[dict]:
+    """Plain-language notices for the page, one per (parent, status) so a big run stays readable.
+    stored_rows ({SCREEN_ID: row count}) lets the "reused" notice say how many rows already exist."""
     stored = {_up(k): v for k, v in (stored or {}).items()}
+    stored_rows = {_up(k): v for k, v in (stored_rows or {}).items()}
     names = plan["names"]
     groups: dict[tuple[str, str], list[str]] = {}
     for l in plan["links"]:
@@ -205,7 +207,9 @@ def describe_plan(plan: dict, stored: dict[str, int] | None = None) -> list[dict
             msg = f"{who} will use {p}, which is already in this run (generated first)."
             level = "info"
         elif status == "reused":
-            msg = f"{who} will reuse the {p} data already stored in v{stored.get(parent, '?')}; {p} is not generated again."
+            n_rows = stored_rows.get(parent)
+            rows_text = f"{n_rows} row{'' if n_rows == 1 else 's'}" if n_rows else "data"
+            msg = f"{p}: {rows_text} already in your database (v{stored.get(parent, '?')}), will be reused for {who}. It is not generated again."
             level = "info"
         elif status == "not_generated":
             msg = f"{who} {'needs' if n == 1 else 'need'} {p}, but adding it automatically is switched off. Those fields get invented values."
