@@ -9,6 +9,7 @@ Storing is best effort: generation must never fail because storage did. save_run
 small dict describing what happened, which /generate passes back to the UI.
 """
 
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -48,6 +49,11 @@ async def _save(conn: asyncpg.Connection, meta: dict, results: list) -> dict:
                 """,
                 run_id, float(meta.get("duration_seconds") or 0),
             )
+            if meta.get("logs"):  # a top-up keeps the earlier logs and adds its own
+                await conn.execute(
+                    "UPDATE dd_runs SET params = jsonb_set(params, '{logs}', COALESCE(params->'logs', '[]'::jsonb) || $2::jsonb) WHERE id = $1",
+                    run_id, meta["logs"],
+                )
         else:
             version_no = (await conn.fetchval("SELECT COALESCE(MAX(version_no), 0) + 1 FROM dd_runs")) or 1
             await conn.execute("UPDATE dd_runs SET is_current = FALSE WHERE is_current")
@@ -67,6 +73,7 @@ async def _save(conn: asyncpg.Connection, meta: dict, results: list) -> dict:
                     # Real wall-clock time of the request. started_at/finished_at cannot show this: both come from
                     # NOW(), which Postgres freezes at the start of the transaction.
                     "duration_seconds": meta.get("duration_seconds"),
+                    "logs": meta.get("logs") or [],
                 },
             )
 
@@ -160,6 +167,73 @@ async def save_run(profile_id: str, meta: dict, results: list) -> dict:
     return info
 
 
+def _as_json(v):
+    return json.loads(v) if isinstance(v, (str, bytes)) else v
+
+
+async def _profile_pool(profile_id: str):
+    profile = await profiles_service.get_profile(profile_id)
+    if not profile or profile.get("db_status") != "ready":
+        return None
+    return await profile_db.get_profile_pool(profile.get("db_name") or profile_db.db_name_for(profile_id))
+
+
+async def stored_screen_versions(profile_id: str) -> dict[str, int]:
+    """{SCREEN_ID (upper-case): version_no} for every screen that already has rows in the profile's CURRENT version.
+    Used by relationship-based generation to reuse parent data instead of generating it again. Never raises."""
+    try:
+        pool = await _profile_pool(profile_id)
+        if pool is None:
+            return {}
+        async with pool.acquire() as conn:
+            found = await conn.fetch(
+                """
+                SELECT UPPER(s.screen_id) AS sid, r.version_no
+                FROM dd_run_screens s JOIN dd_runs r ON r.id = s.run_id
+                WHERE r.is_current AND s.status = 'ok' AND s.row_count > 0 AND s.screen_id IS NOT NULL
+                """
+            )
+        return {r["sid"]: r["version_no"] for r in found}
+    except Exception:  # noqa: BLE001
+        logger.exception("run_store: could not read stored screens for profile %s", profile_id)
+        return {}
+
+
+async def stored_screen_data(profile_id: str, screen_ids: list[str], max_rows: int = 200) -> dict[str, dict]:
+    """{SCREEN_ID (upper-case): {"name", "fields", "rows", "version_no"}} from the profile's CURRENT version,
+    for the given screens (at most max_rows rows each). Never raises."""
+    out: dict[str, dict] = {}
+    ids = sorted({str(i).upper() for i in screen_ids if i})
+    if not ids:
+        return out
+    try:
+        pool = await _profile_pool(profile_id)
+        if pool is None:
+            return out
+        async with pool.acquire() as conn:
+            screens = await conn.fetch(
+                """
+                SELECT s.id, UPPER(s.screen_id) AS sid, s.screen, s.fields, r.version_no
+                FROM dd_run_screens s JOIN dd_runs r ON r.id = s.run_id
+                WHERE r.is_current AND s.status = 'ok' AND s.row_count > 0 AND UPPER(s.screen_id) = ANY($1::text[])
+                """,
+                ids,
+            )
+            for s in screens:
+                rows = await conn.fetch(
+                    "SELECT data FROM dd_rows WHERE run_screen_id = $1 ORDER BY row_index LIMIT $2", s["id"], max_rows
+                )
+                out[s["sid"]] = {
+                    "name": s["screen"],
+                    "fields": _as_json(s["fields"]) or [],
+                    "rows": [_as_json(r["data"]) for r in rows],
+                    "version_no": s["version_no"],
+                }
+    except Exception:  # noqa: BLE001
+        logger.exception("run_store: could not read stored rows for profile %s", profile_id)
+    return out
+
+
 _RUNS_SQL = """
 SELECT r.id, r.version_no, r.is_current, r.top_up, r.domain, r.subdomain, r.geography, r.resolved_geography,
        r.catalog_version, r.mode, r.seed, r.target_name, r.note, r.started_at, r.finished_at,
@@ -249,6 +323,7 @@ async def get_bundle(profile_id: str, run_id: int) -> dict | None:
         "catalog_version", "mode", "seed", "target_name", "note", "started_at", "finished_at",
     )}
     version["duration_seconds"] = (run["params"] or {}).get("duration_seconds")
+    version["logs"] = (run["params"] or {}).get("logs") or []
     return {
         "format": "demo-data-bundle",
         "format_version": 1,

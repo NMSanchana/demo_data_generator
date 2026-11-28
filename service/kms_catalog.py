@@ -730,6 +730,7 @@ def _field_info(p: dict) -> dict:
     if ml is None:
         ml = _int_or_none(maxlen.get("database"))
     visible = field.get("visibleOnScreen")
+    fk = db.get("foreignKey") if isinstance(db.get("foreignKey"), dict) else {}
 
     return {
         "name": str(p.get("field_name") or "").strip(),
@@ -747,6 +748,9 @@ def _field_info(p: dict) -> dict:
         "table": _norm_table(db.get("table")),
         "column": str(db.get("column") or ""),
         "primaryKey": db.get("primaryKey") is True,
+        # declared database foreign key of this field: which table/column it points at (used by relationship-based generation)
+        "fkTable": _norm_table(fk.get("table")),
+        "fkColumn": str(fk.get("column") or ""),
         "required": bool(mand.get("required") or db.get("nullable") is False),
         "dataType": dtype.lower(),
     }

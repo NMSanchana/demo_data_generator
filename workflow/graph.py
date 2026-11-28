@@ -41,8 +41,10 @@ logger = logging.getLogger(__name__)
 async def identifier_dedup_node(state: dict) -> dict:
     rows = state.get("generated_rows") or []
     fields = state.get("generated_fields") or []
+    before = {id(r): dict(r) for r in rows}
     deduped = dedup_identifiers(rows, fields)
-    return {"generated_rows": deduped}
+    renamed = sum(1 for r in deduped for k, v in r.items() if k in before.get(id(r), {}) and before[id(r)][k] != v)
+    return {"generated_rows": deduped, "dedup_renamed": renamed}
 
 
 async def error_node(state: dict) -> dict:

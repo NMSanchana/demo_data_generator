@@ -107,10 +107,11 @@ def _build_user_message(state: dict) -> str:
         )
         parts.append(json.dumps(apm_type_hints))
 
+        parent_values = state.get("parent_values") or {}
         fk_options_block = {
             field_name: field_meta["fk_options"]
             for field_name, field_meta in apm_type_hints.items()
-            if field_meta.get("fk_options")
+            if field_meta.get("fk_options") and field_name not in parent_values  # parent values take priority
         }
         if fk_options_block:
             parts.append("")
@@ -121,11 +122,23 @@ def _build_user_message(state: dict) -> str:
             )
             parts.append(json.dumps(fk_options_block))
 
+    parent_values = state.get("parent_values") or {}
+    if parent_values:
+        parts.append("")
+        parts.append(
+            "parent_values (each of these fields points at a row of ANOTHER screen that was generated "
+            "earlier in this same run. For every field listed, the value MUST be copied exactly from its "
+            "list -- never invent one, never alter it. Spread the rows across the listed values so several "
+            "parent records are used, and let the rest of the row make sense with the chosen parent):"
+        )
+        parts.append(json.dumps(parent_values))
+
     entity_assignment_map = state.get("entity_assignment_map") or {}
     relevant_pools = {
         f["field_name"]: entity_assignment_map[f["field_name"]]
         for f in fields
         if f.get("kind") == "picklist" and f["field_name"] in entity_assignment_map
+        and f["field_name"] not in parent_values  # a parent's values win over the shared pool
     }
     if relevant_pools:
         parts.append("")
@@ -169,6 +182,7 @@ async def data_generator_agent_node(state: dict) -> dict:
             "generated_rows": [],
             "resolved_geography": None,
             "generation_error": "No fields available — schema extraction must run first.",
+            "generation_batches": [],
         }
 
     logger.info(
@@ -185,6 +199,7 @@ async def data_generator_agent_node(state: dict) -> dict:
     id_like = [f["field_name"] for f in fields if f.get("kind") in ("identifier", "name")]
 
     rows: list[dict] = []
+    batches: list[int] = []
     resolved_geography = None
     batch_state = dict(state)
 
@@ -201,15 +216,16 @@ async def data_generator_agent_node(state: dict) -> dict:
             if rows:
                 logger.warning("data_generator_agent_node: a later batch failed (%s) -- keeping the %d row(s) already generated", result["error"], len(rows))
                 break
-            return {"generated_rows": [], "resolved_geography": None, "generation_error": result["error"]}
+            return {"generated_rows": [], "resolved_geography": None, "generation_error": result["error"], "generation_batches": batches}
 
         batch = [r for r in (result.get("rows") or []) if isinstance(r, dict)]
         if not batch:
             if rows:
                 break
-            return {"generated_rows": [], "resolved_geography": None, "generation_error": "Agent returned no rows."}
+            return {"generated_rows": [], "resolved_geography": None, "generation_error": "Agent returned no rows.", "generation_batches": batches}
 
         rows.extend(batch[:want])
+        batches.append(len(batch[:want]))
         logger.info("data_generator_agent_node: batch of %d done (%d/%d rows)", len(batch[:want]), len(rows), total)
 
         # The first batch resolves the typed place; later batches reuse it unchanged.
@@ -219,4 +235,4 @@ async def data_generator_agent_node(state: dict) -> dict:
             batch_state["geography_already_resolved"] = True
 
     logger.info("data_generator_agent_node: generated %d row(s)", len(rows))
-    return {"generated_rows": rows, "resolved_geography": resolved_geography, "generation_error": None}
+    return {"generated_rows": rows, "resolved_geography": resolved_geography, "generation_error": None, "generation_batches": batches}

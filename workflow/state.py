@@ -29,12 +29,18 @@ class GeneratorState(TypedDict, total=False):
     # resolution failed for this screen (generation still proceeds).
     apm_type_hints: dict
 
+    # Relationship-based generation: {field_name: [allowed values]} for fields that point at another
+    # screen already generated (or stored) -- the field may only use these values. {} if none.
+    parent_values: dict
+
     # Built once per request (main.py) across every resolved screen's
     # picklist fields -- {} if there were no picklist fields anywhere.
     entity_assignment_map: dict
 
     # --- Data generator agent outputs ---
     generated_rows:      list[dict]
+    generation_batches:  list[int]    # rows returned by each LLM batch, e.g. [5, 5, 3]
+    dedup_renamed:       int          # identifier values renamed because they were duplicates
     resolved_geography:  str | None   # what geography text was resolved to, e.g.
                                       # "Tamil Nadu, India" -- None if geography was
                                       # disabled/not provided for this screen

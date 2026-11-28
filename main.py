@@ -10,6 +10,12 @@ from dotenv import load_dotenv
 from models import (
     GenerateRequest,
     GenerateResponse,
+    LogEntry,
+    PlanNotice,
+    PlanRequest,
+    PlanResponse,
+    PlannedScreen,
+    ResolvedFeature,
     ScreenResult,
     SaveRowRequest,
     SaveRowResponse,
@@ -18,9 +24,10 @@ from models import (
 from workflow.graph import generator_graph
 from service.apm_client import execute_save
 from service.apm_session import parse_login, login_warnings
-from service import feature_resolver
+from service import feature_resolver, relationship_planner
 from service.postgres_client import init_pool, close_pool
-from service import profile_db, run_store
+from service import profile_db, run_store, kms_catalog
+from service.run_log import RunLog, plain_error
 from Agents import architecture_agent
 from Agents.apm_resolver_agent import resolve_apm_schema
 from Agents.data_generator_agent import build_entity_assignment_map
@@ -199,20 +206,9 @@ async def _resolve_feature_screens(features: list) -> list[dict]:
     return out
 
 
-@app.post("/generate", response_model=GenerateResponse)
-async def generate(request: GenerateRequest):
-    started = time.monotonic()  # real generation time, stored with the version
-    domain_value = request.domain
-    subdomain_value = request.subdomain or None
-    # Raw, as-typed geography text, resolved to a real place by the first
-    # screen's generation call and reused by every screen after that in
-    # this same request (see Agents/data_generator_agent.py).
-    raw_geography = request.geography
-
-    resolved = await _resolve_feature_screens(request.features)
-
-    # Phase 1: schema extraction (cached, deterministic) + APM schema
-    # resolution (cached) for every successfully resolved feature/screen.
+async def _build_contexts(resolved: list[dict]) -> list[dict]:
+    # Schema extraction (cached, deterministic) + APM schema resolution (cached) for every
+    # successfully resolved feature/screen.
     screen_contexts: list[dict] = []
     for r in resolved:
         feat = r["feature"]
@@ -265,6 +261,118 @@ async def generate(request: GenerateRequest):
             "fields_capped": fields_capped,
             "apm_resolution": apm_resolution,
         })
+    return screen_contexts
+
+
+def _up(v) -> str:
+    return str(v or "").strip().upper()
+
+
+async def _plan_relationships(request: GenerateRequest, screen_contexts: list[dict]) -> dict:
+    """
+    Phase 1b. Works out how the selected screens relate (service/relationship_planner.py):
+      - parents that are missing from the run are resolved and added (unless auto_add_parents is off);
+      - parents that already have data in the profile's current version are reused instead;
+      - the screens are ordered parents first.
+    Never fails the request: on any problem the screens simply run in the order given, as before.
+    """
+    info = {"contexts": screen_contexts, "plan": None, "stored": {}}
+    try:
+        ok_ids = [c["screen_id"] for c in screen_contexts if c["ok"] and c.get("screen_id")]
+        if not ok_ids:
+            return info
+        stored = await run_store.stored_screen_versions(request.profile.id)
+        plan = await relationship_planner.build_plan(ok_ids, auto_add=request.auto_add_parents, stored=stored)
+
+        # resolve and add the missing parent screens
+        if plan["auto_add"]:
+            needed_by: dict[str, list[str]] = {}
+            for l in plan["links"]:
+                if l["status"] in ("auto_added",) and l["parent"] in plan["auto_add"]:
+                    needed_by.setdefault(l["parent"], []).append(plan["names"].get(l["child"], l["child"]))
+            parent_rows = min(request.row_count or 10, 20)
+            extra = [
+                ResolvedFeature(id=sid, name=plan["names"].get(sid, sid), data_templates=[sid], row_count=parent_rows)
+                for sid in plan["auto_add"]
+            ]
+            new_contexts = await _build_contexts(await _resolve_feature_screens(extra))
+            for c in new_contexts:
+                c["auto_added"] = True
+                c["auto_added_for"] = sorted(set(needed_by.get(_up(c.get("screen_id")), [])))
+            screen_contexts = screen_contexts + new_contexts
+            logger.info("generate: added %d parent screen(s) first: %s", len(new_contexts),
+                        ", ".join(plan["names"].get(s, s) for s in plan["auto_add"]))
+
+        # parents first (screens without a screen id, i.e. failed ones, keep their place at the end)
+        position = {sid: i for i, sid in enumerate(plan["order"])}
+        screen_contexts = sorted(screen_contexts, key=lambda c: position.get(_up(c.get("screen_id")), len(position)))
+        info.update({"contexts": screen_contexts, "plan": plan, "stored": stored})
+    except Exception:  # noqa: BLE001
+        logger.exception("generate: relationship planning failed -- generating screens independently")
+    return info
+
+
+@app.post("/generate", response_model=GenerateResponse)
+async def generate(request: GenerateRequest):
+    started = time.monotonic()  # real generation time, stored with the version
+    domain_value = request.domain
+    subdomain_value = request.subdomain or None
+    # Raw, as-typed geography text, resolved to a real place by the first
+    # screen's generation call and reused by every screen after that in
+    # this same request (see Agents/data_generator_agent.py).
+    raw_geography = request.geography
+
+    logger.info(
+        "generate: profile=%s mode=%s screens requested=%d",
+        request.profile.id, request.profile.mode, sum(len(f.data_templates) for f in request.features),
+    )
+
+    log = RunLog()
+    mode_label = {"full": "Full", "partial": "Partial", "add": "Add to existing"}.get(request.profile.mode or "", "Partial")
+    n_requested = sum(len(f.data_templates) for f in request.features)
+    log.info(
+        f"{mode_label} run for profile '{request.profile.name}': {n_requested} screen(s) requested"
+        + (f", target {request.profile.target_name}" if request.profile.target_name else "")
+        + (f", geography '{raw_geography}'" if raw_geography else "")
+        + (f", domain '{domain_value}'" if domain_value else "")
+        + (". New rows will be added to the current version." if request.profile.mode == "add" else ".")
+    )
+    if not APM_ENABLED:
+        log.info("APM is switched off (APM_ENABLED=false): rows are previews and cannot be pushed.")
+
+    resolved = await _resolve_feature_screens(request.features)
+
+    screen_contexts = await _build_contexts(resolved)
+
+    # Phase 1b: relationships -- order parents first, add missing parents, find parent data to reuse
+    rel = await _plan_relationships(request, screen_contexts)
+    screen_contexts = rel["contexts"]
+
+    for c in screen_contexts:
+        name = c["screen_name"]
+        if not c["ok"]:
+            log.error(f"Could not prepare this screen: {plain_error(c['error'])}", name)
+            continue
+        src = {"kms": "KMS", "architecture_agent": "the screen's source code (GitLab)"}.get(c["fields_source"], c["fields_source"])
+        log.info(f"Resolved to module {c['module']} (APM module '{c['apm_module']}'); {c['fields_total']} field(s) read from {src}.", name)
+        if c.get("fields_capped"):
+            log.warning(f"The screen has {c['fields_total']} fields; only the first {len(c['fields'])} are generated (MAX_FIELDS_PER_SCREEN).", name)
+        res = c["apm_resolution"]
+        if res.get("ok"):
+            log.info("APM is ready for this screen: rows can be pushed.", name)
+        else:
+            log.warning(f"APM is not ready for this screen, so rows cannot be pushed: {res.get('error') or 'reason not given'}", name)
+        if c.get("auto_added"):
+            who = ", ".join(c.get("auto_added_for") or []) or "another screen"
+            log.info(f"Added automatically because {who} needs it; generated before it.", name)
+    plan_info = rel["plan"]
+    if plan_info:
+        reused = [l for l in plan_info["links"] if l["status"] == "reused"]
+        for parent in sorted({l["parent"] for l in reused}):
+            log.info(f"Reusing {plan_info['names'].get(parent, parent)} from v{rel['stored'].get(parent, '?')} (already stored); not generated again.")
+        log.info("Generation order (parents first): " + " \u2192 ".join(plan_info["names"].get(s, s) for s in plan_info["order"]) + ".")
+    elif any(c["ok"] for c in screen_contexts):
+        log.warning("Related screens could not be worked out; screens are generated independently, in the order given.")
 
     if not any(c["ok"] for c in screen_contexts):
         first_error = next((c["error"] for c in screen_contexts if not c["ok"]), "Generation failed.")
@@ -288,6 +396,12 @@ async def generate(request: GenerateRequest):
             geography=raw_geography,
             picklist_field_names=picklist_field_names,
         )
+        if picklist_field_names:
+            n_pools = len(entity_assignment_maps[module])
+            if n_pools:
+                log.info(f"Module {module}: fixed value lists agreed for {n_pools} dropdown field(s) so screens use the same names.")
+            else:
+                log.warning(f"Module {module}: could not agree shared values for its dropdown fields; each screen picks its own.")
 
     # Phase 3: per-screen row generation. geography starts as the raw
     # typed text; the first screen to run resolves it to a real place and
@@ -296,12 +410,25 @@ async def generate(request: GenerateRequest):
     geography_for_next_screen = raw_geography
     geography_resolved_yet = False
 
+    # Relationship-based generation: rows of screens finished so far (and parent data reused from the stored
+    # version) are the only allowed values for the child fields that point at them.
+    plan = rel["plan"]
+    sources: dict[str, dict] = {}
+    owners: dict[str, str] = {}
+    if plan:
+        try:
+            owners = await relationship_planner.table_owners()
+            reused_ids = [l["parent"] for l in plan["links"] if l["status"] == "reused"]
+            sources.update(await run_store.stored_screen_data(request.profile.id, reused_ids))
+        except Exception:  # noqa: BLE001
+            logger.exception("generate: could not load parent data -- screens will not be linked")
+
     results: list[ScreenResult] = []
     for ctx in screen_contexts:
         feat = ctx["feature"]
         if not ctx["ok"]:
             results.append(ScreenResult(
-                status="error", message=ctx["error"],
+                status="error", message=plain_error(ctx["error"]),
                 feature_id=feat.id, feature_name=feat.name, data_template=ctx["data_template"],
                 screen=ctx["screen_name"],
             ))
@@ -309,6 +436,19 @@ async def generate(request: GenerateRequest):
 
         apm_resolution = ctx["apm_resolution"]
         apm_ready = bool(apm_resolution.get("ok"))
+
+        parent_values: dict[str, list] = {}
+        notes: list[str] = []
+        if plan:
+            parent_values, field_notes = relationship_planner.parent_values_for(ctx["fields"], ctx.get("screen_id") or "", sources, owners)
+            notes = relationship_planner.child_notes(plan, ctx.get("screen_id") or "", rel["stored"]) + field_notes
+
+        sname = ctx["screen_name"]
+        want_rows = feat.row_count or request.row_count or 20
+        for n in notes:
+            log.info(n, sname)
+        log.info(f"Generating {want_rows} row(s)" + (f" using {len(parent_values)} linked field(s)" if parent_values else "") + ".", sname)
+        screen_started = time.monotonic()
 
         initial_state = {
             "module": ctx["module"],
@@ -321,32 +461,53 @@ async def generate(request: GenerateRequest):
             "generated_fields": ctx["fields"],
             "apm_type_hints": apm_resolution.get("scalar_fields", {}) if apm_ready else {},
             "entity_assignment_map": entity_assignment_maps.get(ctx["module"], {}),
+            "parent_values": parent_values,
         }
 
         try:
             final_state = await generator_graph.ainvoke(initial_state)
         except Exception as e:
             logger.exception("Generation pipeline crashed for feature=%r (%s/%s)", feat.id, ctx["module"], ctx["screen_name"])
+            log.error(f"Generation failed: {plain_error(e)}", sname)
             results.append(ScreenResult(
-                status="error", message=str(e),
+                status="error", message=plain_error(e),
                 feature_id=feat.id, feature_name=feat.name, data_template=ctx["data_template"],
                 screen=ctx["screen_name"],
             ))
             continue
 
         if final_state.get("generation_error"):
+            log.error(f"Generation failed: {plain_error(final_state['generation_error'])}", sname)
             results.append(ScreenResult(
-                status="error", message=final_state["generation_error"],
+                status="error", message=plain_error(final_state["generation_error"]),
                 feature_id=feat.id, feature_name=feat.name, data_template=ctx["data_template"],
                 screen=ctx["screen_name"],
             ))
             continue
 
         if final_state.get("resolved_geography"):
+            if not geography_resolved_yet:
+                log.info(f"Geography '{raw_geography}' resolved to '{final_state['resolved_geography']}'; every later screen uses it.", sname)
             geography_for_next_screen = final_state["resolved_geography"]
             geography_resolved_yet = True
 
         rows = final_state.get("generated_rows") or []
+        if parent_values:
+            replaced = relationship_planner.enforce_parent_values(rows, parent_values)
+            if replaced:
+                msg = f"{replaced} value(s) that did not come from a parent screen were replaced with parent values."
+                notes.append(msg)
+                log.warning(msg, sname)
+        batches = final_state.get("generation_batches") or []
+        took = round(time.monotonic() - screen_started, 1)
+        if len(rows) < want_rows:
+            log.warning(f"Only {len(rows)} of {want_rows} requested row(s) were produced (batches: {', '.join(map(str, batches)) or 'none'}).", sname)
+        else:
+            log.info(f"Generated {len(rows)} row(s) in {len(batches)} batch(es) ({', '.join(map(str, batches))}) in {took}s.", sname)
+        if final_state.get("dedup_renamed"):
+            log.info(f"{final_state['dedup_renamed']} duplicate identifier value(s) were renamed to keep them unique.", sname)
+        if plan and ctx.get("screen_id"):
+            sources[_up(ctx["screen_id"])] = {"name": ctx["screen_name"], "fields": ctx["fields"], "rows": rows}
         results.append(ScreenResult(
             status="ok",
             feature_id=feat.id, feature_name=feat.name, data_template=ctx["data_template"],
@@ -365,11 +526,15 @@ async def generate(request: GenerateRequest):
             apm_ready=apm_ready,
             apm_disabled_reason=None if apm_ready else apm_resolution.get("error"),
             resolved_geography=final_state.get("resolved_geography"),
+            auto_added=bool(ctx.get("auto_added")),
+            auto_added_for=ctx.get("auto_added_for") or [],
+            relationship_notes=notes,
         ))
 
     # Store this run as the next version in the profile's own database. Best effort: never fails the request.
     meta = {
         "top_up": request.profile.top_up,
+        "mode": request.profile.mode,
         "domain": domain_value, "subdomain": subdomain_value, "geography": raw_geography,
         "resolved_geography": next((r.resolved_geography for r in results if r.resolved_geography), None),
         "catalog_version": request.profile.catalog_version,
@@ -377,9 +542,55 @@ async def generate(request: GenerateRequest):
         "row_count": request.row_count,
         "duration_seconds": round(time.monotonic() - started, 1),
     }
+    ok_n = sum(1 for r in results if r.status == "ok")
+    total_rows = sum(r.row_count for r in results)
+    log.info(f"Finished: {ok_n} of {len(results)} screen(s) generated, {total_rows} row(s), in {meta['duration_seconds']}s. Storing in the profile database.")
+    meta["logs"] = list(log.entries)
     storage = await run_store.save_run(request.profile.id, meta, results)
+    if storage.get("saved"):
+        log.info(
+            f"Stored as v{storage.get('version_no')}" + (" (rows added to the existing version)" if storage.get("appended") else "")
+            + f" in database {storage.get('db_name')}: {storage.get('rows_saved')} row(s)."
+        )
+    else:
+        log.error(f"The rows were generated but NOT stored in the profile database: {storage.get('error') or 'no reason given'}")
 
-    return GenerateResponse(profile_id=request.profile.id, results=results, storage=StorageInfo(**storage))
+    return GenerateResponse(
+        profile_id=request.profile.id, results=results, storage=StorageInfo(**storage),
+        logs=[LogEntry(**e) for e in log.entries],
+    )
+
+
+# ---------------------------------------------------------------------
+# Plan -- what Generate will do about related screens (no generation, no LLM)
+# ---------------------------------------------------------------------
+
+@app.post("/plan", response_model=PlanResponse)
+async def plan_generation(request: PlanRequest):
+    """Fast, in-memory check run before generating: which selected screens need which parent screens, which parents
+    will be generated first or reused from stored data, and which cannot be provided."""
+    unresolved: list[str] = []
+    screen_ids: list[str] = []
+    for feat in request.features:
+        for template in feat.data_templates:
+            hit = await kms_catalog.lookup_screen(template)
+            if hit is None or hit.get("generatable") is False:
+                unresolved.append(template)
+            elif hit["screen_id"] not in screen_ids:
+                screen_ids.append(hit["screen_id"])
+    if not screen_ids:
+        return PlanResponse(unresolved=unresolved)
+
+    stored = await run_store.stored_screen_versions(request.profile_id) if request.profile_id else {}
+    plan = await relationship_planner.build_plan(screen_ids, auto_add=request.auto_add_parents, stored=stored)
+    added = set(plan["auto_add"])
+    order = [PlannedScreen(screen_id=s, name=plan["names"].get(s, s), auto_added=s in added) for s in plan["order"]]
+    return PlanResponse(
+        notices=[PlanNotice(**n) for n in relationship_planner.describe_plan(plan, stored)],
+        order=order,
+        auto_added=[p for p in order if p.auto_added],
+        unresolved=unresolved,
+    )
 
 
 # ---------------------------------------------------------------------

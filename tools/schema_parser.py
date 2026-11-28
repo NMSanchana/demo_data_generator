@@ -207,6 +207,10 @@ def _meta_extra(it: dict) -> dict:
         "data_type": data_type,
         "max_length": it.get("maxLength"),
         "allowed_values": it.get("allowedValues"),
+        # relationship info: the database column behind this field and, when it is a foreign key, what it points at
+        "db_column": it.get("column"),
+        "fk_table": it.get("fkTable"),
+        "fk_column": it.get("fkColumn"),
     }
 
 

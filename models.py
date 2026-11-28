@@ -18,9 +18,16 @@ Geography and Domain are both plain free-text strings now, not enums:
 - Subdomain was already free text end-to-end -- unchanged.
 """
 
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+
+# How a run is meant to work:
+#   full    -> every screen that applies to the profile; creates a new version
+#   partial -> only the screens the user picked; creates a new version
+#   add     -> adds rows to the profile's current version (same screen -> more rows, new screen -> new entry)
+GenerationMode = Literal["full", "partial", "add"]
 
 
 class ProfileMeta(BaseModel):
@@ -40,8 +47,20 @@ class ProfileMeta(BaseModel):
     top_up:  bool = Field(
         False, description="'Top up an existing dataset instead of regenerating'. "
                             "The run is appended to the profile's current stored version "
-                            "instead of creating a new one (see service/run_store.py)."
+                            "instead of creating a new one (see service/run_store.py). "
+                            "Kept for older clients; it is always in step with mode ('add')."
     )
+    mode: GenerationMode | None = Field(
+        None, description="'full', 'partial' or 'add'. Saved with the run and shown in History."
+    )
+
+    @model_validator(mode="after")
+    def _sync_mode_and_top_up(self):
+        # Older clients only send top_up; newer ones send mode. Keep the two consistent.
+        if self.mode is None:
+            self.mode = "add" if self.top_up else "partial"
+        self.top_up = self.mode == "add"
+        return self
 
 
 class ResolvedFeature(BaseModel):
@@ -69,6 +88,10 @@ class GenerateRequest(BaseModel):
     geography: str | None = Field(None, description="Resolved from the profile's Geography dimension selection, e.g. 'India'")
     features:  list[ResolvedFeature] = Field(..., min_length=1)
     row_count: int | None = Field(None, ge=1, le=100, description="Default rows per screen (default 20); a feature's own row_count overrides this")
+    auto_add_parents: bool = Field(
+        True, description="When a selected screen has a foreign key to a screen that is not selected (and has no stored data), "
+                           "generate that parent screen first and use its values. False = leave it out; the child then gets invented values."
+    )
 
 
 class ScreenResult(BaseModel):
@@ -105,6 +128,11 @@ class ScreenResult(BaseModel):
     resolved_geography:     str | None = Field(
         None, description="What the agent resolved the typed geography text to, e.g. 'Tamil Nadu, India'"
     )
+    auto_added:             bool = Field(False, description="True when this screen was not selected: it was added because another screen needs it")
+    auto_added_for:         list[str] = Field(default_factory=list, description="Screens that needed this auto-added screen")
+    relationship_notes:     list[str] = Field(
+        default_factory=list, description="Plain-language notes on how this screen used (or could not use) its parent screens' data"
+    )
 
 
 class StorageInfo(BaseModel):
@@ -118,10 +146,18 @@ class StorageInfo(BaseModel):
     error:        str | None = None
 
 
+class LogEntry(BaseModel):
+    t:       float = Field(0, description="Seconds since the run started")
+    level:   Literal["info", "warning", "error"] = "info"
+    screen:  str | None = Field(None, description="The screen this line is about; None for run-wide lines")
+    message: str
+
+
 class GenerateResponse(BaseModel):
     profile_id: str
     results:    list[ScreenResult] = []
     storage:    StorageInfo | None = None
+    logs:       list[LogEntry] = Field(default_factory=list, description="The readable log of this run, grouped by screen in the UI")
 
 
 class SaveRowRequest(BaseModel):
@@ -163,3 +199,33 @@ class SaveRowResponse(BaseModel):
                      "APM schema field (exactly or fuzzily), so they were dropped "
                      "from the save body.",
     )
+
+# ---------------------------------------------------------------------
+# /plan -- what Generate will do about related screens, before anything is generated
+# ---------------------------------------------------------------------
+
+class PlanRequest(BaseModel):
+    profile_id: str | None = Field(None, description="Used to find parent data already stored in the profile's current version")
+    features: list[ResolvedFeature] = Field(..., min_length=1)
+    auto_add_parents: bool = True
+
+
+class PlanNotice(BaseModel):
+    level:   Literal["info", "warning"]
+    kind:    str = Field(..., description="auto_added | in_run | reused | not_generated | unavailable | limit")
+    screen:  str | None = Field(None, description="KMS id of the parent screen the notice is about")
+    parent:  str | None = Field(None, description="Display name of that parent screen")
+    message: str
+
+
+class PlannedScreen(BaseModel):
+    screen_id: str
+    name:      str
+    auto_added: bool = False
+
+
+class PlanResponse(BaseModel):
+    notices:  list[PlanNotice] = []
+    order:    list[PlannedScreen] = Field(default_factory=list, description="Every screen of the run, parents first")
+    auto_added: list[PlannedScreen] = []
+    unresolved: list[str] = Field(default_factory=list, description="Requested screens KMS does not know (they cannot be planned)")
